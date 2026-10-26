@@ -27,8 +27,10 @@ MEDIAMARKT_URL = "https://www.mediamarkt.de/de/product/_sony-playstationr5-pro-2
 # Sony shop (PS Direct moved to playstation.com/de-de/store/hardware in Oct 2026).
 # Set the GitHub variable PSDIRECT_URL to EITHER the PS5 Pro product page in
 # Sony's store OR a JSON stock request URL copied from DevTools.
-PSDIRECT_URL = (os.environ.get("PSDIRECT_URL")
-                or "https://www.playstation.com/de-de/ps5/ps5-pro/buy-now/")
+PSDIRECT_DEFAULT = "https://www.playstation.com/de-de/ps5/ps5-pro/buy-now/"
+PSDIRECT_URL = (os.environ.get("PSDIRECT_URL") or "").strip().strip("\"'").strip()
+if not PSDIRECT_URL.startswith("https://"):
+    PSDIRECT_URL = PSDIRECT_DEFAULT
 # Link sent in the Telegram alert:
 PSDIRECT_PAGE = os.environ.get("PSDIRECT_PAGE") or PSDIRECT_URL
 
@@ -171,7 +173,7 @@ def parse_jsonld(text):
 
 def check_psdirect(s):
     if not PSDIRECT_URL.startswith("https://"):
-        return "ERROR", None, "PSDIRECT_URL not set"
+        return "ERROR", None, f"bad PSDIRECT_URL: {PSDIRECT_URL!r}"
     r = s.get(PSDIRECT_URL, headers={"Referer": "https://www.playstation.com/de-de/"})
     info = page_info("playstation", r)
     if r.status_code != 200:
@@ -228,23 +230,23 @@ def main():
         send_telegram("✅ PS5 checker test: Telegram works.")
         print("Test message sent.")
     state = load_state()
-    print("--- PS5 Pro stock check ---")
+    print("--- PS5 Pro stock check (version 7) ---")
+    print(f"PlayStation URL: {PSDIRECT_URL}")
     for name, fn, link in STORES:
         status, price, note = "ERROR", None, ""
-        use_proxy = True
-        for attempt in range(3):  # retry with a fresh IP if blocked
+        # Direct first (free); Oxylabs only if the shop blocks GitHub's IP.
+        used = "direct"
+        for use_proxy in (False, True, True):
             try:
                 status, price, note = fn(make_session(use_proxy))
             except Exception as e:
                 status, price, note = "ERROR", None, str(e)[:160]
                 if use_proxy and "CONNECT tunnel failed" in str(e):
-                    print(f"[{name}] proxy refused this site, trying without proxy")
-                    use_proxy = False
-                    continue
+                    break  # Oxylabs refuses this site; nothing more to try
+            used = "proxy" if use_proxy else "direct"
             if status not in ("BLOCKED", "ERROR"):
                 break
-        if not use_proxy:
-            note += " (no proxy)"
+        note += f" (via {used})"
 
         print(f"[{name}] {status} price={price} ({note})")
 

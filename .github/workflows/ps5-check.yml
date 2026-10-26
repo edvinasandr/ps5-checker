@@ -9,6 +9,10 @@ on:
         description: "Send a Telegram test message"
         type: boolean
         default: false
+      debug:
+        description: "Save downloaded pages for troubleshooting"
+        type: boolean
+        default: false
 
 concurrency:
   group: ps5-check
@@ -42,7 +46,16 @@ jobs:
           PSDIRECT_PAGE: ${{ vars.PSDIRECT_URL }}
           MAX_PRICE: "900"
           TEST_ALERT: ${{ inputs.test_alert }}
-        run: python ps5_checker.py
+          DEBUG: ${{ inputs.debug }}
+        run: python -u ps5_checker.py
+
+      - name: Upload debug pages
+        if: always() && inputs.debug
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-pages
+          path: debug/
+          if-no-files-found: ignore
 
       - name: Save state
         if: always()

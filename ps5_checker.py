@@ -132,7 +132,11 @@ def check_amazon(s):
 
 
 def parse_jsonld(text):
-    """Read schema.org Product availability/price from a product page."""
+    """Read schema.org availability/price of the page's MAIN product.
+
+    MediaMarkt wraps it as BuyAction -> object (ProductGroup) and also lists
+    other consoles under hasVariant; those are ignored on purpose.
+    """
     blocks = re.findall(
         r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', text, re.S)
     for b in blocks:
@@ -142,7 +146,11 @@ def parse_jsonld(text):
             continue
         items = data if isinstance(data, list) else data.get("@graph", [data])
         for item in items:
-            if not isinstance(item, dict) or item.get("@type") != "Product":
+            if not isinstance(item, dict):
+                continue
+            if item.get("@type") == "BuyAction":
+                item = item.get("object") or {}
+            if item.get("@type") not in ("Product", "ProductGroup"):
                 continue
             offers = item.get("offers") or {}
             if isinstance(offers, list):
@@ -151,9 +159,12 @@ def parse_jsonld(text):
                 inner = offers["offers"]
                 offers = inner[0] if isinstance(inner, list) and inner else offers
             avail = str(offers.get("availability", ""))
+            if not avail:
+                continue
             price = parse_eur(offers.get("price") or offers.get("lowPrice"))
             status = "IN_STOCK" if avail.endswith("InStock") else "OUT"
-            return status, price, avail.rsplit("/", 1)[-1] or "no availability"
+            name = str(item.get("name", "")).strip()[:40]
+            return status, price, f"{avail.rsplit('/', 1)[-1]} [{name}]"
     return None
 
 

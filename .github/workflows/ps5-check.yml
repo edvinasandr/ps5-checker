@@ -1,0 +1,52 @@
+# Save as .github/workflows/ps5-check.yml
+name: PS5 Pro stock check
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # GitHub's minimum; runs are often delayed
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Send a Telegram test message"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ps5-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install curl_cffi
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: ps5-state-${{ github.run_id }}
+          restore-keys: ps5-state-
+
+      - name: Run checker
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OXYLABS_USER: ${{ secrets.OXYLABS_USER }}
+          OXYLABS_PASS: ${{ secrets.OXYLABS_PASS }}
+          PSDIRECT_URL: ${{ vars.PSDIRECT_URL }}
+          PSDIRECT_PAGE: ${{ vars.PSDIRECT_URL }}
+          MAX_PRICE: "900"
+          TEST_ALERT: ${{ inputs.test_alert }}
+        run: python ps5_checker.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: ps5-state-${{ github.run_id }}

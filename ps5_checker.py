@@ -33,8 +33,12 @@ PSDIRECT_PAGE = os.environ.get("PSDIRECT_PAGE") or "https://www.playstation.com/
 
 
 # ---------------------------------------------------------------- helpers ---
-def make_session():
+def make_session(use_proxy=True):
     """New sticky residential IP per call (different IP per store)."""
+    if not use_proxy:
+        s = requests.Session(impersonate="chrome", timeout=25)
+        s.headers.update({"Accept-Language": "de-DE,de;q=0.9,en;q=0.8"})
+        return s
     sid = random.randint(1_000_000_000, 9_999_999_999)
     pw = urllib.parse.quote(OXY_PASS, safe="")
     proxy = (f"http://customer-{OXY_USER}-cc-de-sessid-{sid}-sesstime-10:"
@@ -61,6 +65,21 @@ def parse_eur(text):
         return float(num)
     except ValueError:
         return None
+
+
+DEBUG = os.environ.get("DEBUG") == "true"
+
+
+def page_info(name, r):
+    """Save the page in debug mode and return a short description."""
+    if DEBUG:
+        os.makedirs("debug", exist_ok=True)
+        fn = re.sub(r"[^a-z0-9]+", "_", name.lower()) + ".html"
+        with open(os.path.join("debug", fn), "w", encoding="utf-8") as f:
+            f.write(r.text)
+    m = re.search(r"<title[^>]*>(.*?)</title>", r.text, re.S | re.I)
+    title = html.unescape(m.group(1)).strip()[:70] if m else "no title"
+    return f"HTTP {r.status_code}, {len(r.text)} bytes, title='{title}'"
 
 
 def send_telegram(text):
@@ -91,8 +110,9 @@ def alert(store, price, link):
 def check_amazon(s):
     r = s.get(AMAZON_URL)
     t = r.text
+    info = page_info("amazon", r)
     if r.status_code != 200 or "captcha" in t.lower():
-        return "BLOCKED", None, f"HTTP {r.status_code} / captcha"
+        return "BLOCKED", None, f"captcha/blocked; {info}"
 
     has_cart = 'id="add-to-cart-button"' in t
 
@@ -108,7 +128,7 @@ def check_amazon(s):
 
     if has_cart and sold_by_amazon:
         return "IN_STOCK", price, "sold by Amazon"
-    return "OUT", price, f"cart={has_cart} amazon_seller={sold_by_amazon}"
+    return "OUT", price, f"cart={has_cart} amazon_seller={sold_by_amazon}; {info}"
 
 
 def parse_jsonld(text):
@@ -141,6 +161,7 @@ def check_psdirect(s):
     if not PSDIRECT_URL.startswith("https://"):
         return "ERROR", None, "PSDIRECT_URL not set"
     r = s.get(PSDIRECT_URL, headers={"Referer": "https://www.playstation.com/de-de/"})
+    info = page_info("playstation", r)
     if r.status_code != 200:
         return "BLOCKED", None, f"HTTP {r.status_code} (final URL: {r.url})"
 
@@ -160,17 +181,18 @@ def check_psdirect(s):
     res = parse_jsonld(r.text)
     if res:
         return res
-    return "ERROR", None, "no stock data on page (send me the DevTools request)"
+    return "ERROR", None, f"no stock data on page; {info}"
 
 
 def check_mediamarkt(s):
     r = s.get(MEDIAMARKT_URL)
+    info = page_info("mediamarkt", r)
     if r.status_code != 200:
-        return "BLOCKED", None, f"HTTP {r.status_code}"
+        return "BLOCKED", None, info
     res = parse_jsonld(r.text)
     if res:
         return res
-    return "ERROR", None, "no product JSON-LD found (blocked or page changed)"
+    return "ERROR", None, f"no product JSON-LD found; {info}"
 
 
 STORES = [
@@ -197,13 +219,20 @@ def main():
     print("--- PS5 Pro stock check ---")
     for name, fn, link in STORES:
         status, price, note = "ERROR", None, ""
-        for attempt in range(2):  # retry once with a fresh IP if blocked
+        use_proxy = True
+        for attempt in range(3):  # retry with a fresh IP if blocked
             try:
-                status, price, note = fn(make_session())
+                status, price, note = fn(make_session(use_proxy))
             except Exception as e:
-                status, price, note = "ERROR", None, str(e)[:120]
+                status, price, note = "ERROR", None, str(e)[:160]
+                if use_proxy and "CONNECT tunnel failed" in str(e):
+                    print(f"[{name}] proxy refused this site, trying without proxy")
+                    use_proxy = False
+                    continue
             if status not in ("BLOCKED", "ERROR"):
                 break
+        if not use_proxy:
+            note += " (no proxy)"
 
         print(f"[{name}] {status} price={price} ({note})")
 

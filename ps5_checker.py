@@ -27,9 +27,10 @@ MEDIAMARKT_URL = "https://www.mediamarkt.de/de/product/_sony-playstationr5-pro-2
 # Sony shop (PS Direct moved to playstation.com/de-de/store/hardware in Oct 2026).
 # Set the GitHub variable PSDIRECT_URL to EITHER the PS5 Pro product page in
 # Sony's store OR a JSON stock request URL copied from DevTools.
-PSDIRECT_URL = os.environ.get("PSDIRECT_URL") or os.environ.get("PSDIRECT_API_URL", "")
+PSDIRECT_URL = (os.environ.get("PSDIRECT_URL")
+                or "https://www.playstation.com/de-de/ps5/ps5-pro/buy-now/")
 # Link sent in the Telegram alert:
-PSDIRECT_PAGE = os.environ.get("PSDIRECT_PAGE") or "https://www.playstation.com/de-de/store/hardware"
+PSDIRECT_PAGE = os.environ.get("PSDIRECT_PAGE") or PSDIRECT_URL
 
 
 # ---------------------------------------------------------------- helpers ---

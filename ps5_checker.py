@@ -33,8 +33,12 @@ SATURN_URL = "https://www.saturn.de/de/product/_sony-playstationr5-pro-2-tb-kons
 
 ALTERNATE_URL = "https://www.alternate.de/Sony-Interactive-Entertainment/PlayStation-5-Pro-2-TB-E-Chassis-Spielkonsole/html/product/100160951"
 EXPERT_URL = "https://www.expert.de/shop/unsere-produkte/gaming-freizeit/sony-playstation/playstation-konsolen/11364201744-playstation-5-pro.html"
+# expert loads stock via this API (store chosen by the website for you):
+EXPERT_API_URL = "https://production.brntgs.expert.de/api/pricepds?webcode=11364201744&storeId=e_2879130"
 
 TZ = ZoneInfo("Europe/Vilnius")
+# Warn on Telegram when a store fails this many runs in a row (6 x 5 min = 30 min)
+FAIL_WARN_AFTER = int(os.environ.get("FAIL_WARN_AFTER", "6"))
 HISTORY_FILE = "restocks.csv"
 
 # Sony shop (PS Direct moved to playstation.com/de-de/store/hardware in Oct 2026).
@@ -92,6 +96,9 @@ def page_info(name, r):
         os.makedirs("debug", exist_ok=True)
         fn = re.sub(r"[^a-z0-9]+", "_", name.lower()) + ".html"
         with open(os.path.join("debug", fn), "w", encoding="utf-8") as f:
+            if isinstance(r, Partial):
+                f.write("<!-- PARTIAL PAGE: download stopped after the stock data to save "
+                        "proxy traffic, so it looks blank in a browser. -->\n")
             f.write(r.text)
     m = re.search(r"<title[^>]*>(.*?)</title>", r.text, re.S | re.I)
     title = html.unescape(m.group(1)).strip()[:70] if m else "no title"
@@ -307,7 +314,27 @@ def check_alternate(s):
 
 
 def check_expert(s):
-    return check_jsonld_shop(s, EXPERT_URL, "expert")
+    r = s.get(EXPERT_API_URL, headers={"Accept": "application/json",
+                                       "Origin": "https://www.expert.de",
+                                       "Referer": "https://www.expert.de/"})
+    if r.status_code != 200:
+        return "BLOCKED", None, f"HTTP {r.status_code}"
+    try:
+        p = r.json().get("price") or {}
+    except ValueError:
+        return "ERROR", None, f"no JSON; {page_info('expert', r)}"
+    if not p:
+        return "ERROR", None, "empty price data"
+    online = p.get("onlineStock") or 0
+    action = str(p.get("onlineButtonAction") or "NONE")
+    price = None
+    for k in ("bruttoPrice", "price", "salesPrice", "grossPrice"):
+        if isinstance(p.get(k), (int, float, str)):
+            price = parse_eur(p.get(k))
+            if price:
+                break
+    in_stock = online > 0 or "CART" in action.upper() or "BUY" in action.upper()
+    return ("IN_STOCK" if in_stock else "OUT"), price, f"onlineStock={online} button={action}"
 
 
 def check_mediamarkt(s):
@@ -347,7 +374,7 @@ def main():
         print("Test messages sent.")
     state = load_state()
     ts = now_str()
-    print(f"--- PS5 Pro stock check (version 11) --- {ts} Vilnius")
+    print(f"--- PS5 Pro stock check (version 14) --- {ts} Vilnius")
     print(f"PlayStation URL: {PSDIRECT_URL}")
     for name, fn, link in STORES:
         status, price, note = "ERROR", None, ""
@@ -388,6 +415,17 @@ def main():
 
         if status in ("IN_STOCK", "OUT"):  # don't overwrite state on errors
             st["status"] = status
+            if st.get("fails", 0) >= FAIL_WARN_AFTER:
+                send_telegram(f"✅ <b>{html.escape(name)}</b>: checking works again.")
+            st["fails"] = 0
+        else:
+            st["fails"] = st.get("fails", 0) + 1
+            print(f"[{name}] failed {st['fails']} run(s) in a row")
+            if st["fails"] == FAIL_WARN_AFTER:
+                send_telegram(
+                    f"⚠️ <b>{html.escape(name)}</b>: could not be checked for "
+                    f"{FAIL_WARN_AFTER} runs in a row. You may miss a restock there.\n"
+                    f"Last error: {html.escape(note[:150])}")
         if st.get("last_restock"):
             print(f"[{name}] last restock: {st['last_restock']}")
 

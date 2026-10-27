@@ -9,6 +9,11 @@ on:
         type: choice
         options: [all, free, proxy]
         default: all
+      report:
+        description: "Only send a report to Telegram (no checks)"
+        type: choice
+        options: [none, this hour, last hour, today, yesterday]
+        default: none
       test_alert:
         description: "Send a Telegram test message"
         type: boolean
@@ -64,6 +69,7 @@ jobs:
           STORE_GROUP: ${{ env.GROUP }}
           TEST_ALERT: ${{ inputs.test_alert }}
           DEBUG: ${{ inputs.debug }}
+          REPORT: ${{ inputs.report }}
         run: python -u ps5_checker.py
 
       - name: Save restock history to repo
@@ -90,14 +96,14 @@ jobs:
           if-no-files-found: ignore
 
       - name: Save state (free stores)
-        if: always() && (env.GROUP == 'free' || env.GROUP == 'all')
+        if: always() && (env.GROUP == 'free' || env.GROUP == 'all') && (inputs.report == '' || inputs.report == 'none')
         uses: actions/cache/save@v4
         with:
           path: state-free.json
           key: ps5-state-free-${{ github.run_id }}
 
       - name: Save state (proxy stores)
-        if: always() && (env.GROUP == 'proxy' || env.GROUP == 'all')
+        if: always() && (env.GROUP == 'proxy' || env.GROUP == 'all') && (inputs.report == '' || inputs.report == 'none')
         uses: actions/cache/save@v4
         with:
           path: state-proxy.json

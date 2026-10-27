@@ -1,14 +1,19 @@
-"""PS5 Pro stock checker: Amazon.de, PlayStation Direct DE, MediaMarkt.de
+"""PS5 Pro stock checker: Amazon.de, PlayStation Store DE, MediaMarkt.de, Saturn.de,
+Alternate.de, expert.de
 Requires: pip install curl_cffi
 Env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, OXYLABS_USER, OXYLABS_PASS
-Optional: MAX_PRICE (default 850), STATE_FILE (default state.json)
+Optional: MAX_PRICE (default 900), STATE_FILE (default state.json)
+Restock history is appended to restocks.csv (committed by the workflow).
 """
+import csv
 import html
 import json
 import os
 import random
 import re
 import urllib.parse
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from curl_cffi import requests
 
@@ -23,6 +28,14 @@ STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 
 AMAZON_URL = "https://www.amazon.de/dp/B0FRYBZR91"
 MEDIAMARKT_URL = "https://www.mediamarkt.de/de/product/_sony-playstationr5-pro-2-tb-konsole-3018022.html"
+# Saturn belongs to MediaMarkt and uses the same product number and page layout:
+SATURN_URL = "https://www.saturn.de/de/product/_sony-playstationr5-pro-2-tb-konsole-3018022.html"
+
+ALTERNATE_URL = "https://www.alternate.de/Sony-Interactive-Entertainment/PlayStation-5-Pro-2-TB-E-Chassis-Spielkonsole/html/product/100160951"
+EXPERT_URL = "https://www.expert.de/shop/unsere-produkte/gaming-freizeit/sony-playstation/playstation-konsolen/11364201744-playstation-5-pro.html"
+
+TZ = ZoneInfo("Europe/Vilnius")
+HISTORY_FILE = "restocks.csv"
 
 # Sony shop (PS Direct moved to playstation.com/de-de/store/hardware in Oct 2026).
 # Set the GitHub variable PSDIRECT_URL to EITHER the PS5 Pro product page in
@@ -132,14 +145,38 @@ def send_telegram(text):
         print(f"Telegram error: {e}")
 
 
-def alert(store, price, link):
-    p = f"€{price:.2f}" if price else "unbekannt"
+def alert(store, price, link, last_restock=None):
+    p = f"€{price:.2f}" if price else "unknown"
+    last = f"\n<b>Last restock here:</b> {last_restock}" if last_restock else ""
     send_telegram(
-        f"🚨 <b>PS5 Pro AUF LAGER!</b> 🚨\n"
-        f"<b>Händler:</b> {html.escape(store)}\n"
-        f"<b>Preis:</b> {p}\n"
-        f"<a href=\"{html.escape(link)}\">Jetzt kaufen</a>"
+        f"🚨 <b>PS5 Pro IN STOCK!</b> 🚨\n"
+        f"<b>Store:</b> {html.escape(store)}\n"
+        f"<b>Price:</b> {p}{last}\n"
+        f"<a href=\"{html.escape(link)}\">Buy now</a>"
     )
+
+
+def sold_out_alert(store, minutes):
+    send_telegram(f"❌ <b>{html.escape(store)}</b>: sold out again "
+                  f"(was in stock for about {minutes} min)")
+
+
+def now_str():
+    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def minutes_between(a, b):
+    fmt = "%Y-%m-%d %H:%M"
+    return int((datetime.strptime(b, fmt) - datetime.strptime(a, fmt)).total_seconds() // 60)
+
+
+def log_history(ts, store, event, price, minutes=""):
+    new = not os.path.exists(HISTORY_FILE)
+    with open(HISTORY_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["time_vilnius", "store", "event", "price_eur", "minutes_in_stock"])
+        w.writerow([ts, store, event, f"{price:.2f}" if price else "", minutes])
 
 
 # ----------------------------------------------------------------- checks ---
@@ -233,9 +270,10 @@ def check_psdirect(s):
     return "ERROR", None, f"no stock data on page; {info}"
 
 
-def check_mediamarkt(s):
-    r = fetch_until(s, MEDIAMARKT_URL, mediamarkt_done, max_bytes=300_000)
-    info = page_info("mediamarkt", r)
+def check_mms(s, url, label):
+    """MediaMarkt and Saturn share the same shop system."""
+    r = fetch_until(s, url, mediamarkt_done, max_bytes=300_000)
+    info = page_info(label, r)
     if r.status_code != 200:
         return "BLOCKED", None, info
     res = parse_jsonld(r.text)
@@ -244,10 +282,49 @@ def check_mediamarkt(s):
     return "ERROR", None, f"no product JSON-LD found; {info}"
 
 
+def jsonld_offer_done(t):
+    """Stop once a complete JSON-LD block with offers has arrived."""
+    for m in re.finditer(r'ld\+json[^>]*>(.*?)</script>', t, re.S):
+        if '"offers"' in m.group(1):
+            return True
+    return False
+
+
+def check_jsonld_shop(s, url, label):
+    """Generic check for shops that publish schema.org Product data."""
+    r = fetch_until(s, url, jsonld_offer_done, max_bytes=1_500_000)
+    info = page_info(label, r)
+    if r.status_code != 200:
+        return "BLOCKED", None, info
+    res = parse_jsonld(r.text)
+    if res:
+        return res
+    return "ERROR", None, f"no product JSON-LD found; {info}"
+
+
+def check_alternate(s):
+    return check_jsonld_shop(s, ALTERNATE_URL, "alternate")
+
+
+def check_expert(s):
+    return check_jsonld_shop(s, EXPERT_URL, "expert")
+
+
+def check_mediamarkt(s):
+    return check_mms(s, MEDIAMARKT_URL, "mediamarkt")
+
+
+def check_saturn(s):
+    return check_mms(s, SATURN_URL, "saturn")
+
+
 STORES = [
     ("Amazon.de", check_amazon, AMAZON_URL),
     ("PlayStation Store DE", check_psdirect, PSDIRECT_PAGE),
     ("MediaMarkt.de", check_mediamarkt, MEDIAMARKT_URL),
+    ("Saturn.de", check_saturn, SATURN_URL),
+    ("Alternate.de", check_alternate, ALTERNATE_URL),
+    ("expert.de", check_expert, EXPERT_URL),
 ]
 
 
@@ -255,17 +332,22 @@ STORES = [
 def load_state():
     try:
         with open(STATE_FILE) as f:
-            return json.load(f)
+            state = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        state = {}
+    # upgrade old format {"store": "OUT"} -> {"store": {"status": "OUT"}}
+    return {k: (v if isinstance(v, dict) else {"status": v}) for k, v in state.items()}
 
 
 def main():
     if os.environ.get("TEST_ALERT") == "true":
-        send_telegram("✅ PS5 checker test: Telegram works.")
-        print("Test message sent.")
+        send_telegram("✅ PS5 checker test: Telegram works. Example alert follows:")
+        alert("MediaMarkt.de (TEST)", 899.99, MEDIAMARKT_URL, "2026-10-27 09:05")
+        sold_out_alert("MediaMarkt.de (TEST)", 12)
+        print("Test messages sent.")
     state = load_state()
-    print("--- PS5 Pro stock check (version 8) ---")
+    ts = now_str()
+    print(f"--- PS5 Pro stock check (version 11) --- {ts} Vilnius")
     print(f"PlayStation URL: {PSDIRECT_URL}")
     for name, fn, link in STORES:
         status, price, note = "ERROR", None, ""
@@ -289,12 +371,25 @@ def main():
             print(f"[{name}] price {price} above MAX_PRICE, no alert")
             status = "OUT"
 
-        if status == "IN_STOCK" and state.get(name) != "IN_STOCK":
-            alert(name, price, link)
+        st = state.setdefault(name, {})
+        prev = st.get("status")
+
+        if status == "IN_STOCK" and prev != "IN_STOCK":
+            alert(name, price, link, st.get("last_restock"))
+            log_history(ts, name, "IN_STOCK", price)
+            st["last_restock"] = ts
             print(f"[{name}] 🚨 ALERT SENT")
+        elif status == "OUT" and prev == "IN_STOCK":
+            mins = minutes_between(st.get("last_restock", ts), ts)
+            sold_out_alert(name, mins)
+            log_history(ts, name, "SOLD_OUT", price, mins)
+            st["last_sold_out"] = ts
+            print(f"[{name}] sold out again after ~{mins} min")
 
         if status in ("IN_STOCK", "OUT"):  # don't overwrite state on errors
-            state[name] = status
+            st["status"] = status
+        if st.get("last_restock"):
+            print(f"[{name}] last restock: {st['last_restock']}")
 
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)

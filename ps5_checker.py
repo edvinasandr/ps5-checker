@@ -35,6 +35,8 @@ SATURN_URL = "https://www.saturn.de/de/product/_sony-playstationr5-pro-2-tb-kons
 
 ALTERNATE_URL = "https://www.alternate.de/Sony-Interactive-Entertainment/PlayStation-5-Pro-2-TB-E-Chassis-Spielkonsole/html/product/100160951"
 EXPERT_URL = "https://www.expert.de/shop/unsere-produkte/gaming-freizeit/sony-playstation/playstation-konsolen/11364201744-playstation-5-pro.html"
+MUELLER_URL = "https://www.mueller.de/p/playstation5-pro-konsole-2-tb-IPN3068364/"
+
 # expert loads stock via this API (store chosen by the website for you):
 EXPERT_API_URL = "https://production.brntgs.expert.de/api/pricepds?webcode=11364201744&storeId=e_2879130"
 
@@ -406,6 +408,33 @@ def check_expert(s):
     return ("IN_STOCK" if in_stock else "OUT"), price, f"{'in stock' if in_stock else 'out of stock'} (online stock: {online}, button: {action.lower()})"
 
 
+def mueller_done(t):
+    return jsonld_offer_done(t) or "nicht lieferbar" in t
+
+
+def check_mueller(s):
+    r = fetch_until(s, MUELLER_URL, mueller_done, max_bytes=1_500_000)
+    info = page_info("mueller", r)
+    if r.status_code != 200:
+        return "BLOCKED", None, info
+    t = r.text
+    title = page_title(r).replace("®", "")
+    if not EXPECTED_NAME.search(title):
+        return "BLOCKED", None, f"not the product page, maybe a security check (title: '{title[:40]}'); {info}"
+    # 1) standard product data, if Müller provides it
+    res = parse_jsonld(t)
+    if res:
+        return res[0], res[1], f"{res[2]}; {info}"
+    # 2) otherwise the availability text shown on the page
+    m = re.search(r"(\d{1,4}(?:\.\d{3})*,\d{2})\s*(?:&nbsp;|\s)*€", t)
+    price = parse_eur(m.group(1)) if m else None
+    if re.search(r"(?i)nicht\s+lieferbar|ausverkauft|nicht\s+verf(?:ü|&uuml;)gbar", t):
+        return "OUT", price, f"out of stock (page text), product verified; {info}"
+    if "In den Warenkorb" in t:
+        return "IN_STOCK", price, f"'add to cart' button found, product verified; {info}"
+    return "ERROR", price, f"stock status not found on page; {info}"
+
+
 def check_mediamarkt(s):
     return check_mms(s, MEDIAMARKT_URL, "mediamarkt")
 
@@ -423,6 +452,7 @@ STORES = [
     ("Saturn.de", check_saturn, SATURN_URL, "proxy"),
     ("Alternate.de", check_alternate, ALTERNATE_URL, "free"),
     ("expert.de", check_expert, EXPERT_URL, "proxy"),
+    ("Müller.de", check_mueller, MUELLER_URL, "proxy"),
 ]
 GROUPS = ("free", "proxy")
 
@@ -676,7 +706,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 22) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 23) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

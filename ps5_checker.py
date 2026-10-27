@@ -2,7 +2,7 @@
 Alternate.de, expert.de
 Requires: pip install curl_cffi
 Env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, OXYLABS_USER, OXYLABS_PASS
-Optional: MAX_PRICE (default 900), STATE_FILE (default state.json)
+Optional: MAX_PRICE (default 900), STORE_GROUP (free | proxy | all)
 Restock history is appended to restocks.csv (committed by the workflow).
 """
 import csv
@@ -12,7 +12,7 @@ import os
 import random
 import re
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from curl_cffi import requests
@@ -24,7 +24,6 @@ OXY_USER = os.environ["OXYLABS_USER"].strip().strip("\"'")
 OXY_PASS = os.environ["OXYLABS_PASS"].strip().strip("\"'")
 
 MAX_PRICE = float(os.environ.get("MAX_PRICE", "900"))  # MSRP 899.99
-STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 
 AMAZON_URL = "https://www.amazon.de/dp/B0FRYBZR91"
 # Amazon's standard add-to-cart link: opens a page where you confirm adding it
@@ -40,9 +39,17 @@ EXPERT_URL = "https://www.expert.de/shop/unsere-produkte/gaming-freizeit/sony-pl
 EXPERT_API_URL = "https://production.brntgs.expert.de/api/pricepds?webcode=11364201744&storeId=e_2879130"
 
 TZ = ZoneInfo("Europe/Vilnius")
-# Warn on Telegram when a store fails this many runs in a row (6 x 5 min = 30 min)
-FAIL_WARN_AFTER = int(os.environ.get("FAIL_WARN_AFTER", "6"))
+# Warn on Telegram when a store has failed for this long (and at least 3 runs)
+FAIL_WARN_MIN = int(os.environ.get("FAIL_WARN_MIN", "30"))
 HISTORY_FILE = "restocks.csv"
+# Which stores this run checks: "free" (no proxy), "proxy" or "all"
+STORE_GROUP = (os.environ.get("STORE_GROUP") or "all").strip().lower()
+SUMMARY_HOUR = 8  # daily report is sent by the first proxy/all run after 08:00
+
+# schema.org availability values that mean "you can order it now"
+BUYABLE = {"InStock", "LimitedAvailability", "OnlineOnly", "PreOrder", "PreSale", "BackOrder"}
+# Sanity check: the page must really be about the PS5 Pro
+EXPECTED_NAME = re.compile(r"(?i)playstation\W*5\W*pro")
 
 # Sony shop (PS Direct moved to playstation.com/de-de/store/hardware in Oct 2026).
 # Set the GitHub variable PSDIRECT_URL to EITHER the PS5 Pro product page in
@@ -56,11 +63,20 @@ PSDIRECT_PAGE = os.environ.get("PSDIRECT_PAGE") or PSDIRECT_URL
 
 
 # ---------------------------------------------------------------- helpers ---
+PROXY_BYTES = [0]  # uncompressed bytes received through the proxy this run
+
+
+def count_bytes(s, n):
+    if getattr(s, "via_proxy", False):
+        PROXY_BYTES[0] += n
+
+
 def make_session(use_proxy=True):
     """New sticky residential IP per call (different IP per store)."""
     if not use_proxy:
         s = requests.Session(impersonate="chrome", timeout=25)
         s.headers.update({"Accept-Language": "de-DE,de;q=0.9,en;q=0.8"})
+        s.via_proxy = False
         return s
     sid = random.randint(1_000_000_000, 9_999_999_999)
     pw = urllib.parse.quote(OXY_PASS, safe="")
@@ -69,6 +85,7 @@ def make_session(use_proxy=True):
     s = requests.Session(impersonate="chrome", timeout=25,
                          proxies={"http": proxy, "https": proxy})
     s.headers.update({"Accept-Language": "de-DE,de;q=0.9,en;q=0.8"})
+    s.via_proxy = True
     return s
 
 
@@ -130,6 +147,7 @@ def fetch_until(s, url, done, max_bytes):
                 break
     finally:
         r.close()
+    count_bytes(s, len(buf))
     return Partial(r.status_code, buf.decode("utf-8", "ignore"), r.headers, r.url)
 
 
@@ -201,7 +219,15 @@ def check_amazon(s):
     if r.status_code != 200 or "captcha" in t.lower():
         return "BLOCKED", None, f"captcha/blocked; {info}"
 
-    has_cart = 'id="add-to-cart-button"' in t
+    title = re.search(r"<title[^>]*>(.*?)</title>", t, re.S | re.I)
+    if not title or not EXPECTED_NAME.search(html.unescape(title.group(1))):
+        return "ERROR", None, f"not the PS5 Pro page; {info}"
+    if 'id="buybox"' not in t and 'id="desktop_buybox"' not in t:
+        return "ERROR", None, f"page layout changed (no buy box area); {info}"
+    if not amazon_done(t):
+        return "ERROR", None, f"page incomplete or layout changed; {info}"
+
+    has_cart = 'id="add-to-cart-button"' in t or 'id="buy-now-button"' in t
 
     i = t.find('id="merchantInfoFeature_feature_div"')
     seller_block = t[i:i + 2500] if i >= 0 else ""
@@ -249,9 +275,13 @@ def parse_jsonld(text):
             if not avail:
                 continue
             price = parse_eur(offers.get("price") or offers.get("lowPrice"))
-            status = "IN_STOCK" if avail.endswith("InStock") else "OUT"
-            name = str(item.get("name", "")).strip()[:40]
-            return status, price, f"{avail.rsplit('/', 1)[-1]} [{name}]"
+            short = avail.rsplit("/", 1)[-1]
+            full_name = str(item.get("name", "")).replace("®", "").strip()
+            name = full_name[:40]
+            if not EXPECTED_NAME.search(full_name):
+                return "ERROR", price, f"unexpected product on page: '{name}'"
+            status = "IN_STOCK" if short in BUYABLE else "OUT"
+            return status, price, f"{short} [{name}]"
     return None
 
 
@@ -259,6 +289,7 @@ def check_psdirect(s):
     if not PSDIRECT_URL.startswith("https://"):
         return "ERROR", None, f"bad PSDIRECT_URL: {PSDIRECT_URL!r}"
     r = s.get(PSDIRECT_URL, headers={"Referer": "https://www.playstation.com/de-de/"})
+    count_bytes(s, len(r.content))
     info = page_info("playstation", r)
     if r.status_code != 200:
         return "BLOCKED", None, f"HTTP {r.status_code} (final URL: {r.url})"
@@ -322,14 +353,15 @@ def check_expert(s):
     r = s.get(EXPERT_API_URL, headers={"Accept": "application/json",
                                        "Origin": "https://www.expert.de",
                                        "Referer": "https://www.expert.de/"})
+    count_bytes(s, len(r.content))
     if r.status_code != 200:
         return "BLOCKED", None, f"HTTP {r.status_code}"
     try:
         p = r.json().get("price") or {}
     except ValueError:
         return "ERROR", None, f"no JSON; {page_info('expert', r)}"
-    if not p:
-        return "ERROR", None, "empty price data"
+    if not p or "onlineStock" not in p or "onlineButtonAction" not in p:
+        return "ERROR", None, "expert response format changed (no onlineStock)"
     online = p.get("onlineStock") or 0
     action = str(p.get("onlineButtonAction") or "NONE")
     price = None
@@ -350,25 +382,135 @@ def check_saturn(s):
     return check_mms(s, SATURN_URL, "saturn")
 
 
+# (name, check function, link for the alert, group)
+# "free" stores work without the proxy and can be checked more often.
 STORES = [
-    ("Amazon.de", check_amazon, AMAZON_URL),
-    ("PlayStation Store DE", check_psdirect, PSDIRECT_PAGE),
-    ("MediaMarkt.de", check_mediamarkt, MEDIAMARKT_URL),
-    ("Saturn.de", check_saturn, SATURN_URL),
-    ("Alternate.de", check_alternate, ALTERNATE_URL),
-    ("expert.de", check_expert, EXPERT_URL),
+    ("Amazon.de", check_amazon, AMAZON_URL, "proxy"),
+    ("PlayStation Store DE", check_psdirect, PSDIRECT_PAGE, "free"),
+    ("MediaMarkt.de", check_mediamarkt, MEDIAMARKT_URL, "proxy"),
+    ("Saturn.de", check_saturn, SATURN_URL, "proxy"),
+    ("Alternate.de", check_alternate, ALTERNATE_URL, "free"),
+    ("expert.de", check_expert, EXPERT_URL, "proxy"),
 ]
+GROUPS = ("free", "proxy")
 
 
 # ------------------------------------------------------------------- main ---
-def load_state():
+def state_file(group):
+    return f"state-{group}.json"
+
+
+def load_state(group):
     try:
-        with open(STATE_FILE) as f:
+        with open(state_file(group)) as f:
             state = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         state = {}
-    # upgrade old format {"store": "OUT"} -> {"store": {"status": "OUT"}}
     return {k: (v if isinstance(v, dict) else {"status": v}) for k, v in state.items()}
+
+
+def day_stats(state, day):
+    return state.setdefault("_stats", {}).setdefault(day, {})
+
+
+def check_store(fn):
+    """Direct first (free); Oxylabs only if the shop blocks GitHub's IP."""
+    status, price, note, used = "ERROR", None, "", "direct"
+    for use_proxy in (False, True, True):
+        try:
+            status, price, note = fn(make_session(use_proxy))
+        except Exception as e:
+            status, price, note = "ERROR", None, str(e)[:160]
+            if use_proxy and "CONNECT tunnel failed" in str(e):
+                break  # Oxylabs refuses this site; nothing more to try
+        used = "proxy" if use_proxy else "direct"
+        if status not in ("BLOCKED", "ERROR"):
+            break
+    return status, price, f"{note} (via {used})"
+
+
+def handle_result(name, link, status, price, note, st, ts):
+    if status == "IN_STOCK" and price and price > MAX_PRICE:
+        print(f"[{name}] price {price} above MAX_PRICE, no alert")
+        status = "OUT"
+    prev = st.get("status")
+
+    if status == "IN_STOCK" and prev != "IN_STOCK":
+        alert(name, price, link, st.get("last_restock"))
+        log_history(ts, name, "IN_STOCK", price)
+        st["last_restock"] = ts
+        print(f"[{name}] 🚨 ALERT SENT")
+    elif status == "OUT" and prev == "IN_STOCK":
+        mins = minutes_between(st.get("last_restock", ts), ts)
+        sold_out_alert(name, mins)
+        log_history(ts, name, "SOLD_OUT", price, mins)
+        st["last_sold_out"] = ts
+        print(f"[{name}] sold out again after ~{mins} min")
+
+    ok = status in ("IN_STOCK", "OUT")
+    if ok:  # never overwrite the stock status on errors
+        st["status"] = status
+        if st.get("fail_warned"):
+            send_telegram(f"✅ <b>{html.escape(name)}</b>: checking works again.")
+        for k in ("fails", "fail_since", "fail_warned"):
+            st.pop(k, None)
+    else:
+        st["fails"] = st.get("fails", 0) + 1
+        st.setdefault("fail_since", ts)
+        down = minutes_between(st["fail_since"], ts)
+        print(f"[{name}] failing for {st['fails']} run(s) / {down} min")
+        if not st.get("fail_warned") and st["fails"] >= 3 and down >= FAIL_WARN_MIN:
+            send_telegram(
+                f"⚠️ <b>{html.escape(name)}</b>: could not be checked for {down} min "
+                f"({st['fails']} runs). You may miss a restock there.\n"
+                f"Last error: {html.escape(note[:150])}")
+            st["fail_warned"] = True
+    if st.get("last_restock"):
+        print(f"[{name}] last restock: {st['last_restock']}")
+    return ok
+
+
+def restocks_on(day):
+    try:
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except FileNotFoundError:
+        return []
+    return [r for r in rows if r["time_vilnius"].startswith(day)]
+
+
+def maybe_send_summary(states, now):
+    """Once a day after SUMMARY_HOUR: report on yesterday."""
+    meta = states["proxy"].setdefault("_meta", {})
+    today = now.strftime("%Y-%m-%d")
+    if now.hour < SUMMARY_HOUR or meta.get("last_summary") == today:
+        return
+    yday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    lines, total_kb, any_stats = [], 0, False
+    for name, _, _, group in STORES:
+        st = states[group].get("_stats", {}).get(yday, {}).get(name)
+        if not st:
+            lines.append(f"❔ {html.escape(name)}: no checks")
+            continue
+        any_stats = True
+        total_kb += st.get("proxy_kb", 0)
+        icon = "✅" if st["ok"] == st["runs"] else ("⚠️" if st["ok"] else "❌")
+        lines.append(f"{icon} {html.escape(name)}: {st['ok']}/{st['runs']} checks OK")
+    meta["last_summary"] = today
+    if not any_stats:
+        return
+    events = restocks_on(yday)
+    if events:
+        ev = "\n" + "\n".join(f"• {e['time_vilnius'][11:]} {html.escape(e['store'])}: "
+                       f"{'in stock' if e['event'] == 'IN_STOCK' else 'sold out'}"
+                       for e in events)
+    else:
+        ev = "none"
+    send_telegram(
+        f"📊 <b>Daily report for {yday}</b>\n" + "\n".join(lines) +
+        f"\n\n<b>Restocks:</b> {ev}\n"
+        f"<b>Proxy traffic:</b> ~{total_kb / 1024:.1f} MB (estimate; exact figure in Oxylabs dashboard)")
+    print("Daily report sent.")
 
 
 def main():
@@ -377,65 +519,41 @@ def main():
         alert("Amazon.de (TEST)", 899.99, AMAZON_URL, "2026-10-27 09:05")
         sold_out_alert("Amazon.de (TEST)", 12)
         print("Test messages sent.")
-    state = load_state()
-    ts = now_str()
-    print(f"--- PS5 Pro stock check (version 15) --- {ts} Vilnius")
-    print(f"PlayStation URL: {PSDIRECT_URL}")
-    for name, fn, link in STORES:
-        status, price, note = "ERROR", None, ""
-        # Direct first (free); Oxylabs only if the shop blocks GitHub's IP.
-        used = "direct"
-        for use_proxy in (False, True, True):
-            try:
-                status, price, note = fn(make_session(use_proxy))
-            except Exception as e:
-                status, price, note = "ERROR", None, str(e)[:160]
-                if use_proxy and "CONNECT tunnel failed" in str(e):
-                    break  # Oxylabs refuses this site; nothing more to try
-            used = "proxy" if use_proxy else "direct"
-            if status not in ("BLOCKED", "ERROR"):
-                break
-        note += f" (via {used})"
 
+    group = STORE_GROUP if STORE_GROUP in ("free", "proxy", "all") else "all"
+    run_groups = GROUPS if group == "all" else (group,)
+    states = {g: load_state(g) for g in GROUPS}
+    now = datetime.now(TZ)
+    ts = now.strftime("%Y-%m-%d %H:%M")
+    day = ts[:10]
+    print(f"--- PS5 Pro stock check (version 16) --- {ts} Vilnius, group: {group}")
+
+    for name, fn, link, g in STORES:
+        if g not in run_groups:
+            continue
+        before = PROXY_BYTES[0]
+        status, price, note = check_store(fn)
         print(f"[{name}] {status} price={price} ({note})")
+        ok = handle_result(name, link, status, price, note, states[g].setdefault(name, {}), ts)
 
-        if status == "IN_STOCK" and price and price > MAX_PRICE:
-            print(f"[{name}] price {price} above MAX_PRICE, no alert")
-            status = "OUT"
+        stats = day_stats(states[g], day).setdefault(name, {"runs": 0, "ok": 0, "proxy_kb": 0})
+        stats["runs"] += 1
+        stats["ok"] += int(ok)
+        # compressed transfer is roughly 1/4 of the page size, plus connection overhead
+        used = PROXY_BYTES[0] - before
+        if used or "(via proxy)" in note:
+            stats["proxy_kb"] = round(stats["proxy_kb"] + used / 4 / 1024 + 5, 1)
 
-        st = state.setdefault(name, {})
-        prev = st.get("status")
+    if "proxy" in run_groups:
+        maybe_send_summary(states, now)
 
-        if status == "IN_STOCK" and prev != "IN_STOCK":
-            alert(name, price, link, st.get("last_restock"))
-            log_history(ts, name, "IN_STOCK", price)
-            st["last_restock"] = ts
-            print(f"[{name}] 🚨 ALERT SENT")
-        elif status == "OUT" and prev == "IN_STOCK":
-            mins = minutes_between(st.get("last_restock", ts), ts)
-            sold_out_alert(name, mins)
-            log_history(ts, name, "SOLD_OUT", price, mins)
-            st["last_sold_out"] = ts
-            print(f"[{name}] sold out again after ~{mins} min")
-
-        if status in ("IN_STOCK", "OUT"):  # don't overwrite state on errors
-            st["status"] = status
-            if st.get("fails", 0) >= FAIL_WARN_AFTER:
-                send_telegram(f"✅ <b>{html.escape(name)}</b>: checking works again.")
-            st["fails"] = 0
-        else:
-            st["fails"] = st.get("fails", 0) + 1
-            print(f"[{name}] failed {st['fails']} run(s) in a row")
-            if st["fails"] == FAIL_WARN_AFTER:
-                send_telegram(
-                    f"⚠️ <b>{html.escape(name)}</b>: could not be checked for "
-                    f"{FAIL_WARN_AFTER} runs in a row. You may miss a restock there.\n"
-                    f"Last error: {html.escape(note[:150])}")
-        if st.get("last_restock"):
-            print(f"[{name}] last restock: {st['last_restock']}")
-
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+    for g in run_groups:
+        st = states[g]
+        old_days = sorted(st.get("_stats", {}))[:-3]  # keep 3 days of stats
+        for d in old_days:
+            del st["_stats"][d]
+        with open(state_file(g), "w") as f:
+            json.dump(st, f)
     print("--- done ---")
 
 

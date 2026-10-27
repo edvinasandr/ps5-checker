@@ -27,6 +27,9 @@ MAX_PRICE = float(os.environ.get("MAX_PRICE", "900"))  # MSRP 899.99
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 
 AMAZON_URL = "https://www.amazon.de/dp/B0FRYBZR91"
+# Amazon's standard add-to-cart link: opens a page where you confirm adding it
+AMAZON_CART_URL = "https://www.amazon.de/gp/aws/cart/add.html?ASIN.1=B0FRYBZR91&Quantity.1=1"
+CART_LINKS = {"Amazon.de": AMAZON_CART_URL}
 MEDIAMARKT_URL = "https://www.mediamarkt.de/de/product/_sony-playstationr5-pro-2-tb-konsole-3018022.html"
 # Saturn belongs to MediaMarkt and uses the same product number and page layout:
 SATURN_URL = "https://www.saturn.de/de/product/_sony-playstationr5-pro-2-tb-konsole-3018022.html"
@@ -160,6 +163,8 @@ def alert(store, price, link, last_restock=None):
         f"<b>Store:</b> {html.escape(store)}\n"
         f"<b>Price:</b> {p}{last}\n"
         f"<a href=\"{html.escape(link)}\">Buy now</a>"
+        + "".join(f"  |  <a href=\"{html.escape(u)}\">🛒 Add to cart</a>"
+                  for k, u in CART_LINKS.items() if store.startswith(k))
     )
 
 
@@ -369,12 +374,12 @@ def load_state():
 def main():
     if os.environ.get("TEST_ALERT") == "true":
         send_telegram("✅ PS5 checker test: Telegram works. Example alert follows:")
-        alert("MediaMarkt.de (TEST)", 899.99, MEDIAMARKT_URL, "2026-10-27 09:05")
-        sold_out_alert("MediaMarkt.de (TEST)", 12)
+        alert("Amazon.de (TEST)", 899.99, AMAZON_URL, "2026-10-27 09:05")
+        sold_out_alert("Amazon.de (TEST)", 12)
         print("Test messages sent.")
     state = load_state()
     ts = now_str()
-    print(f"--- PS5 Pro stock check (version 14) --- {ts} Vilnius")
+    print(f"--- PS5 Pro stock check (version 15) --- {ts} Vilnius")
     print(f"PlayStation URL: {PSDIRECT_URL}")
     for name, fn, link in STORES:
         status, price, note = "ERROR", None, ""

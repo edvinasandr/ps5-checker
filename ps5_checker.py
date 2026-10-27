@@ -56,6 +56,10 @@ HOURLY_TO = int(os.environ.get("HOURLY_TO", "22"))
 
 # schema.org availability values that mean "you can order it now"
 BUYABLE = {"InStock", "LimitedAvailability", "OnlineOnly", "PreOrder", "PreSale", "BackOrder"}
+AVAIL_EN = {"InStock": "in stock", "OutOfStock": "out of stock", "LimitedAvailability": "limited stock",
+            "PreOrder": "pre-order", "PreSale": "pre-sale", "BackOrder": "backorder",
+            "OnlineOnly": "in stock (online only)", "InStoreOnly": "in store only",
+            "SoldOut": "sold out", "Discontinued": "discontinued"}
 # Sanity check: the page must really be about the PS5 Pro
 EXPECTED_NAME = re.compile(r"(?i)playstation\W*5\W*pro")
 
@@ -128,9 +132,12 @@ def page_info(name, r):
                 f.write("<!-- PARTIAL PAGE: download stopped after the stock data to save "
                         "proxy traffic, so it looks blank in a browser. -->\n")
             f.write(r.text)
+    return f"HTTP {r.status_code}, {len(r.text) // 1024} KB"
+
+
+def page_title(r):
     m = re.search(r"<title[^>]*>(.*?)</title>", r.text, re.S | re.I)
-    title = html.unescape(m.group(1)).strip()[:70] if m else "no title"
-    return f"HTTP {r.status_code}, {len(r.text)} bytes, title='{title}'"
+    return html.unescape(m.group(1)).strip()[:60] if m else "no title"
 
 
 class Partial:
@@ -230,11 +237,23 @@ def check_amazon(s):
 
     title = re.search(r"<title[^>]*>(.*?)</title>", t, re.S | re.I)
     if not title or not EXPECTED_NAME.search(html.unescape(title.group(1))):
-        return "ERROR", None, f"not the PS5 Pro page; {info}"
+        return "ERROR", None, f"not the PS5 Pro page (title: '{page_title(r)}'); {info}"
     if 'id="buybox"' not in t and 'id="desktop_buybox"' not in t:
         return "ERROR", None, f"page layout changed (no buy box area); {info}"
     if not amazon_done(t):
         return "ERROR", None, f"page incomplete or layout changed; {info}"
+
+    # Where Amazon thinks we are: GitHub's servers are mostly in the US, and a
+    # non-German visitor may see "cannot be shipped" instead of the buy box.
+    loc = ""
+    i = t.find('id="glow-ingress-line1"')
+    if i >= 0:
+        loc = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", t[i:i + 400])))
+        loc = loc.split(">", 1)[-1].split("Standort")[0].strip()
+    german = bool(re.match(r"Lieferung an .+\b\d{5}\b", loc))
+    loc_en = re.sub(r"^Lieferung (an|nach)\s*", "", loc)[:35] or "unknown"
+    if not german and not getattr(s, "via_proxy", False):
+        return "BLOCKED", None, f"direct page not for Germany (delivery to: {loc_en})"
 
     has_cart = 'id="add-to-cart-button"' in t or 'id="buy-now-button"' in t
 
@@ -249,8 +268,12 @@ def check_amazon(s):
         price = parse_eur(m.group(1)) if m else None
 
     if has_cart and sold_by_amazon:
-        return "IN_STOCK", price, "sold by Amazon"
-    return "OUT", price, f"cart={has_cart} amazon_seller={sold_by_amazon}; {info}"
+        return "IN_STOCK", price, f"buy button, sold by Amazon; delivery to {loc_en}"
+    if has_cart:
+        why = "buy button, but seller is not Amazon"
+    else:
+        why = "no buy button"
+    return "OUT", price, f"{why}; delivery to {loc_en}; {info}"
 
 
 def parse_jsonld(text):
@@ -288,9 +311,9 @@ def parse_jsonld(text):
             full_name = str(item.get("name", "")).replace("®", "").strip()
             name = full_name[:40]
             if not EXPECTED_NAME.search(full_name):
-                return "ERROR", price, f"unexpected product on page: '{name}'"
+                return "ERROR", price, f"wrong product on page: '{name}'"
             status = "IN_STOCK" if short in BUYABLE else "OUT"
-            return status, price, f"{short} [{name}]"
+            return status, price, f"{AVAIL_EN.get(short, short)}, product verified"
     return None
 
 
@@ -380,7 +403,7 @@ def check_expert(s):
             if price:
                 break
     in_stock = online > 0 or "CART" in action.upper() or "BUY" in action.upper()
-    return ("IN_STOCK" if in_stock else "OUT"), price, f"onlineStock={online} button={action}"
+    return ("IN_STOCK" if in_stock else "OUT"), price, f"{'in stock' if in_stock else 'out of stock'} (online stock: {online}, button: {action.lower()})"
 
 
 def check_mediamarkt(s):
@@ -653,7 +676,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 20) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 22) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

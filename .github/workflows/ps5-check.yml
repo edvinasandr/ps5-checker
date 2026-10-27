@@ -1,10 +1,14 @@
 # Save as .github/workflows/ps5-check.yml
 name: PS5 Pro stock check
 on:
-  schedule:
-    - cron: "*/5 * * * *"   # GitHub's minimum; runs are often delayed
+  # Started by cron-job.org via the GitHub API, or manually with "Run workflow".
   workflow_dispatch:
     inputs:
+      group:
+        description: "Which stores to check"
+        type: choice
+        options: [all, free, proxy]
+        default: all
       test_alert:
         description: "Send a Telegram test message"
         type: boolean
@@ -14,14 +18,20 @@ on:
         type: boolean
         default: false
 
+# Each group runs one at a time; the two groups can run in parallel
 concurrency:
-  group: ps5-check
+  group: ps5-${{ inputs.group || 'all' }}
   cancel-in-progress: false
+
+permissions:
+  contents: write   # lets the workflow commit restocks.csv
 
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      GROUP: ${{ inputs.group || 'all' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,12 +39,19 @@ jobs:
           python-version: "3.12"
       - run: pip install curl_cffi
 
-      - name: Restore state
+      - name: Restore state (free stores)
         uses: actions/cache/restore@v4
         with:
-          path: state.json
-          key: ps5-state-${{ github.run_id }}
-          restore-keys: ps5-state-
+          path: state-free.json
+          key: ps5-state-free-${{ github.run_id }}
+          restore-keys: ps5-state-free-
+
+      - name: Restore state (proxy stores)
+        uses: actions/cache/restore@v4
+        with:
+          path: state-proxy.json
+          key: ps5-state-proxy-${{ github.run_id }}
+          restore-keys: ps5-state-proxy-
 
       - name: Run checker
         env:
@@ -43,11 +60,26 @@ jobs:
           OXYLABS_USER: ${{ secrets.OXYLABS_USER }}
           OXYLABS_PASS: ${{ secrets.OXYLABS_PASS }}
           PSDIRECT_URL: ${{ vars.PSDIRECT_URL }}
-          PSDIRECT_PAGE: ${{ vars.PSDIRECT_URL }}
           MAX_PRICE: "900"
+          STORE_GROUP: ${{ env.GROUP }}
           TEST_ALERT: ${{ inputs.test_alert }}
           DEBUG: ${{ inputs.debug }}
         run: python -u ps5_checker.py
+
+      - name: Save restock history to repo
+        if: always()
+        run: |
+          if [ -f restocks.csv ] && [ -n "$(git status --porcelain restocks.csv)" ]; then
+            git config user.name "ps5-checker-bot"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add restocks.csv
+            git commit -m "Restock history update"
+            # the other group may have pushed at the same time: retry
+            for i in 1 2 3; do
+              git pull --rebase && git push && break
+              sleep 3
+            done
+          fi
 
       - name: Upload debug pages
         if: always() && inputs.debug
@@ -57,9 +89,16 @@ jobs:
           path: debug/
           if-no-files-found: ignore
 
-      - name: Save state
-        if: always()
+      - name: Save state (free stores)
+        if: always() && (env.GROUP == 'free' || env.GROUP == 'all')
         uses: actions/cache/save@v4
         with:
-          path: state.json
-          key: ps5-state-${{ github.run_id }}
+          path: state-free.json
+          key: ps5-state-free-${{ github.run_id }}
+
+      - name: Save state (proxy stores)
+        if: always() && (env.GROUP == 'proxy' || env.GROUP == 'all')
+        uses: actions/cache/save@v4
+        with:
+          path: state-proxy.json
+          key: ps5-state-proxy-${{ github.run_id }}

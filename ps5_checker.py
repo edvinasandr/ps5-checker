@@ -85,6 +85,41 @@ def page_info(name, r):
     return f"HTTP {r.status_code}, {len(r.text)} bytes, title='{title}'"
 
 
+class Partial:
+    """Minimal response object for a partially downloaded page."""
+    def __init__(self, status_code, text, headers, url):
+        self.status_code, self.text, self.headers, self.url = status_code, text, headers, url
+
+
+def fetch_until(s, url, done, max_bytes):
+    """Download only until done(text) is True or max_bytes is reached.
+
+    Saves proxy traffic: the stock info sits near the top of the page.
+    """
+    r = s.get(url, stream=True)
+    buf = b""
+    try:
+        for chunk in r.iter_content():
+            buf += chunk
+            if len(buf) >= max_bytes:
+                break
+            if len(buf) > 8192 and done(buf.decode("utf-8", "ignore")):
+                break
+    finally:
+        r.close()
+    return Partial(r.status_code, buf.decode("utf-8", "ignore"), r.headers, r.url)
+
+
+def amazon_done(t):
+    # Product bullets come right after the buy box / seller / price area.
+    return 'id="feature-bullets"' in t or 'id="featurebullets"' in t
+
+
+def mediamarkt_done(t):
+    i = t.find("ld+json")
+    return i >= 0 and t.find("</script>", i) > 0
+
+
 def send_telegram(text):
     try:
         requests.post(
@@ -111,7 +146,7 @@ def alert(store, price, link):
 # Each returns (status, price, note); status: IN_STOCK | OUT | BLOCKED | ERROR
 
 def check_amazon(s):
-    r = s.get(AMAZON_URL)
+    r = fetch_until(s, AMAZON_URL, amazon_done, max_bytes=900_000)
     t = r.text
     info = page_info("amazon", r)
     if r.status_code != 200 or "captcha" in t.lower():
@@ -199,7 +234,7 @@ def check_psdirect(s):
 
 
 def check_mediamarkt(s):
-    r = s.get(MEDIAMARKT_URL)
+    r = fetch_until(s, MEDIAMARKT_URL, mediamarkt_done, max_bytes=300_000)
     info = page_info("mediamarkt", r)
     if r.status_code != 200:
         return "BLOCKED", None, info
@@ -230,7 +265,7 @@ def main():
         send_telegram("✅ PS5 checker test: Telegram works.")
         print("Test message sent.")
     state = load_state()
-    print("--- PS5 Pro stock check (version 7) ---")
+    print("--- PS5 Pro stock check (version 8) ---")
     print(f"PlayStation URL: {PSDIRECT_URL}")
     for name, fn, link in STORES:
         status, price, note = "ERROR", None, ""

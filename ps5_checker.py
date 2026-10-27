@@ -452,7 +452,7 @@ STORES = [
     ("Saturn.de", check_saturn, SATURN_URL, "proxy"),
     ("Alternate.de", check_alternate, ALTERNATE_URL, "free"),
     ("expert.de", check_expert, EXPERT_URL, "proxy"),
-    ("Müller.de", check_mueller, MUELLER_URL, "proxy"),
+    ("Müller.de", check_mueller, MUELLER_URL, "free"),
 ]
 GROUPS = ("free", "proxy")
 
@@ -706,7 +706,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 23) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 24) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

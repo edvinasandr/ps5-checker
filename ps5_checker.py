@@ -45,6 +45,14 @@ HISTORY_FILE = "restocks.csv"
 # Which stores this run checks: "free" (no proxy), "proxy" or "all"
 STORE_GROUP = (os.environ.get("STORE_GROUP") or "all").strip().lower()
 SUMMARY_HOUR = 8  # daily report is sent by the first proxy/all run after 08:00
+# Your cron-job.org schedule, used to work out how many checks *should* happen
+EVERY_MIN = {"free": int(os.environ.get("FREE_EVERY_MIN", "2")),
+             "proxy": int(os.environ.get("PROXY_EVERY_MIN", "5"))}
+CHECK_FROM = int(os.environ.get("CHECK_FROM", "8"))   # first hour with checks
+CHECK_TO = int(os.environ.get("CHECK_TO", "22"))      # last hour with checks
+# Hourly reports are only sent between these hours (Vilnius time, inclusive)
+HOURLY_FROM = int(os.environ.get("HOURLY_FROM", "7"))
+HOURLY_TO = int(os.environ.get("HOURLY_TO", "22"))
 
 # schema.org availability values that mean "you can order it now"
 BUYABLE = {"InStock", "LimitedAvailability", "OnlineOnly", "PreOrder", "PreSale", "BackOrder"}
@@ -161,12 +169,13 @@ def mediamarkt_done(t):
     return i >= 0 and t.find("</script>", i) > 0
 
 
-def send_telegram(text):
+def send_telegram(text, silent=False):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
-                  "parse_mode": "HTML", "disable_web_page_preview": False},
+                  "parse_mode": "HTML", "disable_web_page_preview": True if silent else False,
+                  "disable_notification": silent},
             timeout=10,
         )
     except Exception as e:
@@ -414,9 +423,17 @@ def day_stats(state, day):
 
 
 def check_store(fn):
-    """Direct first (free); Oxylabs only if the shop blocks GitHub's IP."""
+    """Direct first (free); Oxylabs only if the shop blocks GitHub's IP.
+
+    Returns status, price, note and how many requests went direct / via proxy.
+    """
     status, price, note, used = "ERROR", None, "", "direct"
+    n_direct = n_proxy = 0
     for use_proxy in (False, True, True):
+        if use_proxy:
+            n_proxy += 1
+        else:
+            n_direct += 1
         try:
             status, price, note = fn(make_session(use_proxy))
         except Exception as e:
@@ -426,7 +443,7 @@ def check_store(fn):
         used = "proxy" if use_proxy else "direct"
         if status not in ("BLOCKED", "ERROR"):
             break
-    return status, price, f"{note} (via {used})"
+    return status, price, f"{note} (via {used})", n_direct, n_proxy
 
 
 def handle_result(name, link, status, price, note, st, ts):
@@ -479,38 +496,139 @@ def restocks_on(day):
     return [r for r in rows if r["time_vilnius"].startswith(day)]
 
 
+def report_line(name, done, ok, expected):
+    """'✅ Amazon.de: 12/12 successful' plus failed/missing details."""
+    expected = max(expected, done)
+    failed, missing = done - ok, expected - done
+    icon = "✅" if ok == expected else ("⚠️" if ok else "❌")
+    extra = []
+    if failed:
+        extra.append(f"{failed} failed")
+    if missing:
+        extra.append(f"{missing} missing")
+    tail = f" ({', '.join(extra)})" if extra else ""
+    return f"{icon} {html.escape(name)}: {ok}/{expected} successful{tail}", ok, expected
+
+
+def expected_checks(group, start, end):
+    """How many checks the cron-job.org schedule should have made in [start, end)."""
+    n, t = 0, start.replace(second=0, microsecond=0)
+    while t < end:
+        if CHECK_FROM <= t.hour <= CHECK_TO and t.minute % EVERY_MIN[group] == 0:
+            n += 1
+        t += timedelta(minutes=1)
+    return n
+
+
+def hour_data(states, key):
+    """key 'YYYY-MM-DD HH' -> {store: (done, ok, proxy_kb)}"""
+    out = {}
+    for name, _, _, g in STORES:
+        h = states[g].get("_hourly", {}).get(key, {}).get(name)
+        if h:
+            out[name] = (h["checks"], h["ok"], h["proxy_kb"])
+    return out
+
+
+def day_data(states, day):
+    out = {}
+    for name, _, _, g in STORES:
+        d = states[g].get("_stats", {}).get(day, {}).get(name)
+        if d:
+            out[name] = (d["runs"], d["ok"], d.get("proxy_kb", 0))
+    return out
+
+
+def build_report(title, data, start, end, restock_day=None):
+    if not data:
+        return None
+    lines, tot_ok, tot_exp, kb = [], 0, 0, 0.0
+    for name, _, _, g in STORES:
+        done, ok, k = data.get(name, (0, 0, 0))
+        line, ok, exp = report_line(name, done, ok, expected_checks(g, start, end))
+        lines.append(line)
+        tot_ok += ok
+        tot_exp += exp
+        kb += k
+    text = f"{title}\n" + "\n".join(lines) + f"\n\n<b>Total:</b> {tot_ok}/{tot_exp} successful"
+    if restock_day:
+        events = restocks_on(restock_day)
+        ev = ("\n" + "\n".join(
+            f"• {e['time_vilnius'][11:]} {html.escape(e['store'])}: "
+            f"{'in stock' if e['event'] == 'IN_STOCK' else 'sold out'}" for e in events)
+              ) if events else "none"
+        text += f"\n<b>Restocks:</b> {ev}"
+    return text + f"\n<b>Proxy traffic:</b> ~{kb / 1024:.2f} MB (estimate)"
+
+
+def hour_start(dt):
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+
+def day_start(dt):
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def report_for(kind, states, now):
+    """kind: this hour | last hour | today | yesterday"""
+    grace = now - timedelta(minutes=2)  # a run started in the last 2 min may not be saved yet
+    if kind == "this hour":
+        st = hour_start(now)
+        return build_report(f"🕐 <b>This hour so far ({st:%H}:00–{now:%H:%M})</b>",
+                            hour_data(states, f"{st:%Y-%m-%d %H}"), st, grace)
+    if kind == "last hour":
+        st = hour_start(now) - timedelta(hours=1)
+        return build_report(f"🕐 <b>Hourly report {st:%H}:00–{st:%H}:59</b>",
+                            hour_data(states, f"{st:%Y-%m-%d %H}"), st, st + timedelta(hours=1))
+    if kind == "today":
+        st = day_start(now)
+        return build_report(f"📊 <b>Today so far ({now:%Y-%m-%d}, until {now:%H:%M})</b>",
+                            day_data(states, f"{st:%Y-%m-%d}"), st, grace, f"{st:%Y-%m-%d}")
+    if kind == "yesterday":
+        st = day_start(now) - timedelta(days=1)
+        return build_report(f"📊 <b>Daily report for {st:%Y-%m-%d}</b>",
+                            day_data(states, f"{st:%Y-%m-%d}"), st, st + timedelta(days=1),
+                            f"{st:%Y-%m-%d}")
+    return None
+
+
+def restocks_on(day):
+    try:
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except FileNotFoundError:
+        return []
+    return [r for r in rows if r["time_vilnius"].startswith(day)]
+
+
 def maybe_send_summary(states, now):
     """Once a day after SUMMARY_HOUR: report on yesterday."""
     meta = states["proxy"].setdefault("_meta", {})
     today = now.strftime("%Y-%m-%d")
     if now.hour < SUMMARY_HOUR or meta.get("last_summary") == today:
         return
-    yday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    lines, total_kb, any_stats = [], 0, False
-    for name, _, _, group in STORES:
-        st = states[group].get("_stats", {}).get(yday, {}).get(name)
-        if not st:
-            lines.append(f"❔ {html.escape(name)}: no checks")
-            continue
-        any_stats = True
-        total_kb += st.get("proxy_kb", 0)
-        icon = "✅" if st["ok"] == st["runs"] else ("⚠️" if st["ok"] else "❌")
-        lines.append(f"{icon} {html.escape(name)}: {st['ok']}/{st['runs']} checks OK")
     meta["last_summary"] = today
-    if not any_stats:
+    text = report_for("yesterday", states, now)
+    if text:
+        send_telegram(text, silent=True)
+        print("Daily report sent.")
+
+
+def maybe_send_hourly(states, now):
+    """Report on the previous hour, sent by the first proxy run after :05
+    (so the free group, which saves in parallel, has finished that hour)."""
+    meta = states["proxy"].setdefault("_meta", {})
+    this_hour = now.strftime("%Y-%m-%d %H")
+    if meta.get("last_hourly") == this_hour or now.minute < 5:
         return
-    events = restocks_on(yday)
-    if events:
-        ev = "\n" + "\n".join(f"• {e['time_vilnius'][11:]} {html.escape(e['store'])}: "
-                       f"{'in stock' if e['event'] == 'IN_STOCK' else 'sold out'}"
-                       for e in events)
-    else:
-        ev = "none"
-    send_telegram(
-        f"📊 <b>Daily report for {yday}</b>\n" + "\n".join(lines) +
-        f"\n\n<b>Restocks:</b> {ev}\n"
-        f"<b>Proxy traffic:</b> ~{total_kb / 1024:.1f} MB (estimate; exact figure in Oxylabs dashboard)")
-    print("Daily report sent.")
+    meta["last_hourly"] = this_hour
+    prev = now - timedelta(hours=1)
+    if not HOURLY_FROM <= now.hour <= HOURLY_TO or not CHECK_FROM <= prev.hour <= CHECK_TO:
+        return
+    text = report_for("last hour", states, now)
+    if text:
+        send_telegram(text, silent=True)
+        print("Hourly report sent.")
 
 
 def main():
@@ -520,38 +638,61 @@ def main():
         sold_out_alert("Amazon.de (TEST)", 12)
         print("Test messages sent.")
 
+    report = (os.environ.get("REPORT") or "none").strip().lower()
+    if report != "none":
+        states = {g: load_state(g) for g in GROUPS}
+        text = report_for(report, states, datetime.now(TZ))
+        send_telegram(text or f"No check data for '{report}' yet.")
+        print(f"Report '{report}' sent (no checks run).")
+        print(text or "no data")
+        return
+
     group = STORE_GROUP if STORE_GROUP in ("free", "proxy", "all") else "all"
     run_groups = GROUPS if group == "all" else (group,)
     states = {g: load_state(g) for g in GROUPS}
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 16) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 20) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:
             continue
         before = PROXY_BYTES[0]
-        status, price, note = check_store(fn)
+        status, price, note, n_direct, n_proxy = check_store(fn)
         print(f"[{name}] {status} price={price} ({note})")
         ok = handle_result(name, link, status, price, note, states[g].setdefault(name, {}), ts)
+
+        # compressed transfer is roughly 1/4 of the page size, plus ~5 KB
+        # connection overhead per proxy request
+        kb = (PROXY_BYTES[0] - before) / 4 / 1024 + 5 * n_proxy
 
         stats = day_stats(states[g], day).setdefault(name, {"runs": 0, "ok": 0, "proxy_kb": 0})
         stats["runs"] += 1
         stats["ok"] += int(ok)
-        # compressed transfer is roughly 1/4 of the page size, plus connection overhead
-        used = PROXY_BYTES[0] - before
-        if used or "(via proxy)" in note:
-            stats["proxy_kb"] = round(stats["proxy_kb"] + used / 4 / 1024 + 5, 1)
+        stats["proxy_kb"] = round(stats["proxy_kb"] + kb, 1)
+        stats["requests"] = stats.get("requests", 0) + n_direct + n_proxy
+        stats["proxy_requests"] = stats.get("proxy_requests", 0) + n_proxy
+
+        h = states[g].setdefault("_hourly", {}).setdefault(ts[:13], {}).setdefault(
+            name, {"checks": 0, "ok": 0, "req_direct": 0, "req_proxy": 0, "proxy_kb": 0})
+        h["checks"] += 1
+        h["ok"] += int(ok)
+        h["req_direct"] += n_direct
+        h["req_proxy"] += n_proxy
+        h["proxy_kb"] = round(h["proxy_kb"] + kb, 1)
 
     if "proxy" in run_groups:
         maybe_send_summary(states, now)
+        maybe_send_hourly(states, now)
 
     for g in run_groups:
         st = states[g]
         old_days = sorted(st.get("_stats", {}))[:-3]  # keep 3 days of stats
         for d in old_days:
             del st["_stats"][d]
+        for hkey in sorted(st.get("_hourly", {}))[:-48]:  # keep 48 hours
+            del st["_hourly"][hkey]
         with open(state_file(g), "w") as f:
             json.dump(st, f)
     print("--- done ---")

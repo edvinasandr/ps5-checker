@@ -10,6 +10,7 @@ import html
 import json
 import os
 import random
+import time
 import re
 import urllib.parse
 from datetime import datetime, timedelta
@@ -148,12 +149,12 @@ class Partial:
         self.status_code, self.text, self.headers, self.url = status_code, text, headers, url
 
 
-def fetch_until(s, url, done, max_bytes):
+def fetch_until(s, url, done, max_bytes, headers=None):
     """Download only until done(text) is True or max_bytes is reached.
 
     Saves proxy traffic: the stock info sits near the top of the page.
     """
-    r = s.get(url, stream=True)
+    r = s.get(url, stream=True, headers=headers)
     buf = b""
     try:
         for chunk in r.iter_content():
@@ -322,15 +323,16 @@ def parse_jsonld(text):
 def check_psdirect(s):
     if not PSDIRECT_URL.startswith("https://"):
         return "ERROR", None, f"bad PSDIRECT_URL: {PSDIRECT_URL!r}"
-    r = s.get(PSDIRECT_URL, headers={"Referer": "https://www.playstation.com/de-de/"})
-    count_bytes(s, len(r.content))
+    # The product data ends ~34 KB into a ~950 KB page: stop there (faster, fewer timeouts)
+    r = fetch_until(s, PSDIRECT_URL, jsonld_offer_done, max_bytes=1_500_000,
+                    headers={"Referer": "https://www.playstation.com/de-de/"})
     info = page_info("playstation", r)
     if r.status_code != 200:
         return "BLOCKED", None, f"HTTP {r.status_code} (final URL: {r.url})"
 
     # Case 1: JSON stock request copied from DevTools
     if "json" in r.headers.get("content-type", ""):
-        data = r.json()
+        data = json.loads(r.text)
         products = data.get("products") or [data]
         p = products[0] if products else {}
         stock = ((p.get("stock") or {}).get("stockLevelStatus")
@@ -492,7 +494,15 @@ def check_store(fn):
         except Exception as e:
             status, price, note = "ERROR", None, str(e)[:160]
             if use_proxy and "CONNECT tunnel failed" in str(e):
-                break  # Oxylabs refuses this site; nothing more to try
+                # Oxylabs refuses this site (PlayStation): give direct one more try
+                time.sleep(3)
+                n_direct += 1
+                try:
+                    status, price, note = fn(make_session(False))
+                except Exception as e2:
+                    status, price, note = "ERROR", None, str(e2)[:160]
+                used = "direct, 2nd try"
+                break
         used = "proxy" if use_proxy else "direct"
         if status not in ("BLOCKED", "ERROR"):
             break
@@ -706,7 +716,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 24) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 25) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

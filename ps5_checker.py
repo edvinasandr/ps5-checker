@@ -484,7 +484,17 @@ def state_file(group):
 def gist_headers():
     return {"Authorization": f"Bearer {GIST_TOKEN}",
             "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28"}
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "ps5-stock-checker"}  # GitHub rejects requests without one
+
+
+def gist_error(r):
+    """GitHub's own explanation, e.g. 'Resource not accessible by personal access token'."""
+    try:
+        msg = r.json().get("message", "")
+    except Exception:
+        msg = r.text[:150]
+    return f"HTTP {r.status_code}: {msg}"
 
 
 def load_all_states():
@@ -493,15 +503,17 @@ def load_all_states():
     if GIST_ID and GIST_TOKEN:
         try:
             r = requests.get(GIST_API, headers=gist_headers(), timeout=15)
-            r.raise_for_status()
+            if r.status_code != 200:
+                raise Exception(gist_error(r))
             files = r.json().get("files", {})
             for g in GROUPS:
                 f = files.get(state_file(g))
                 if f is None:
                     raw[g], ok[g] = "{}", True      # file not created yet
                 elif f.get("truncated"):
-                    rr = requests.get(f["raw_url"], timeout=15)
-                    rr.raise_for_status()
+                    rr = requests.get(f["raw_url"], headers=gist_headers(), timeout=15)
+                    if rr.status_code != 200:
+                        raise Exception(gist_error(rr))
                     raw[g], ok[g] = rr.text, True
                 else:
                     raw[g], ok[g] = f.get("content") or "{}", True
@@ -534,7 +546,8 @@ def save_states(states, groups):
         payload = {"files": {state_file(g): {"content": json.dumps(states[g])} for g in groups}}
         try:
             r = requests.patch(GIST_API, headers=gist_headers(), json=payload, timeout=15)
-            r.raise_for_status()
+            if r.status_code != 200:
+                raise Exception(gist_error(r))
         except Exception as e:
             print(f"Could not save state to Gist: {str(e)[:150]}")
     else:
@@ -786,7 +799,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 27) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 28) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

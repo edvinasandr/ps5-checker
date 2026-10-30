@@ -192,17 +192,27 @@ def send_telegram(text, silent=False):
         print(f"Telegram error: {e}")
 
 
+# How many times the in-stock alert is sent, and the pause between messages
+ALERT_REPEAT = int(os.environ.get("ALERT_REPEAT", "5"))
+ALERT_GAP_SEC = float(os.environ.get("ALERT_GAP_SEC", "3"))
+
+
 def alert(store, price, link, last_restock=None):
     p = f"€{price:.2f}" if price else "unknown"
     last = f"\n<b>Last restock here:</b> {last_restock}" if last_restock else ""
+    buy = (f"<a href=\"{html.escape(link)}\">Buy now</a>"
+           + "".join(f"  |  <a href=\"{html.escape(u)}\">🛒 Add to cart</a>"
+                     for k, u in CART_LINKS.items() if store.startswith(k)))
     send_telegram(
         f"🚨 <b>PS5 Pro IN STOCK!</b> 🚨\n"
         f"<b>Store:</b> {html.escape(store)}\n"
-        f"<b>Price:</b> {p}{last}\n"
-        f"<a href=\"{html.escape(link)}\">Buy now</a>"
-        + "".join(f"  |  <a href=\"{html.escape(u)}\">🛒 Add to cart</a>"
-                  for k, u in CART_LINKS.items() if store.startswith(k))
+        f"<b>Price:</b> {p}{last}\n" + buy
     )
+    # Repeat a short version so the phone buzzes several times
+    for i in range(2, ALERT_REPEAT + 1):
+        time.sleep(ALERT_GAP_SEC)
+        send_telegram(f"🚨 ({i}/{ALERT_REPEAT}) PS5 Pro IN STOCK at "
+                      f"<b>{html.escape(store)}</b>! {buy}")
 
 
 def sold_out_alert(store, minutes):
@@ -716,7 +726,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 25) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 26) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

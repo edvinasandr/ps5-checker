@@ -470,17 +470,77 @@ GROUPS = ("free", "proxy")
 
 
 # ------------------------------------------------------------------- main ---
+# Saved state lives in a private GitHub Gist (one file per group), read and
+# written through the GitHub API. Falls back to local files if not configured.
+GIST_ID = (os.environ.get("GIST_ID") or "").strip()
+GIST_TOKEN = (os.environ.get("GIST_TOKEN") or "").strip()
+GIST_API = f"https://api.github.com/gists/{GIST_ID}"
+
+
 def state_file(group):
     return f"state-{group}.json"
 
 
-def load_state(group):
-    try:
-        with open(state_file(group)) as f:
-            state = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        state = {}
-    return {k: (v if isinstance(v, dict) else {"status": v}) for k, v in state.items()}
+def gist_headers():
+    return {"Authorization": f"Bearer {GIST_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"}
+
+
+def load_all_states():
+    """Returns ({group: state}, {group: loaded_ok}). Never raises."""
+    raw, ok = {}, {}
+    if GIST_ID and GIST_TOKEN:
+        try:
+            r = requests.get(GIST_API, headers=gist_headers(), timeout=15)
+            r.raise_for_status()
+            files = r.json().get("files", {})
+            for g in GROUPS:
+                f = files.get(state_file(g))
+                if f is None:
+                    raw[g], ok[g] = "{}", True      # file not created yet
+                elif f.get("truncated"):
+                    rr = requests.get(f["raw_url"], timeout=15)
+                    rr.raise_for_status()
+                    raw[g], ok[g] = rr.text, True
+                else:
+                    raw[g], ok[g] = f.get("content") or "{}", True
+        except Exception as e:
+            print(f"Could not load state from Gist: {str(e)[:150]}")
+            for g in GROUPS:
+                raw[g], ok[g] = "{}", False
+    else:
+        print("GIST_ID / GIST_TOKEN not set: using local state files")
+        for g in GROUPS:
+            try:
+                with open(state_file(g)) as f:
+                    raw[g] = f.read()
+            except FileNotFoundError:
+                raw[g] = "{}"
+            ok[g] = True
+    states = {}
+    for g in GROUPS:
+        try:
+            st = json.loads(raw[g] or "{}")
+        except json.JSONDecodeError:
+            st = {}
+        states[g] = {k: (v if isinstance(v, dict) else {"status": v}) for k, v in st.items()}
+    return states, ok
+
+
+def save_states(states, groups):
+    """Writes only the given groups' files, so the two groups never overwrite each other."""
+    if GIST_ID and GIST_TOKEN:
+        payload = {"files": {state_file(g): {"content": json.dumps(states[g])} for g in groups}}
+        try:
+            r = requests.patch(GIST_API, headers=gist_headers(), json=payload, timeout=15)
+            r.raise_for_status()
+        except Exception as e:
+            print(f"Could not save state to Gist: {str(e)[:150]}")
+    else:
+        for g in groups:
+            with open(state_file(g), "w") as f:
+                json.dump(states[g], f)
 
 
 def day_stats(state, day):
@@ -713,7 +773,7 @@ def main():
 
     report = (os.environ.get("REPORT") or "none").strip().lower()
     if report != "none":
-        states = {g: load_state(g) for g in GROUPS}
+        states, _ = load_all_states()
         text = report_for(report, states, datetime.now(TZ))
         send_telegram(text or f"No check data for '{report}' yet.")
         print(f"Report '{report}' sent (no checks run).")
@@ -722,11 +782,11 @@ def main():
 
     group = STORE_GROUP if STORE_GROUP in ("free", "proxy", "all") else "all"
     run_groups = GROUPS if group == "all" else (group,)
-    states = {g: load_state(g) for g in GROUPS}
+    states, loaded = load_all_states()
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 26) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 27) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:
@@ -755,19 +815,24 @@ def main():
         h["req_proxy"] += n_proxy
         h["proxy_kb"] = round(h["proxy_kb"] + kb, 1)
 
-    if "proxy" in run_groups:
+    if "proxy" in run_groups and loaded["proxy"]:
         maybe_send_summary(states, now)
         maybe_send_hourly(states, now)
 
+    to_save = []
     for g in run_groups:
+        if not loaded[g]:
+            # Saving would overwrite the good state with an empty one
+            print(f"State for group '{g}' was not loaded, so it is not saved this run")
+            continue
         st = states[g]
-        old_days = sorted(st.get("_stats", {}))[:-3]  # keep 3 days of stats
-        for d in old_days:
+        for d in sorted(st.get("_stats", {}))[:-3]:  # keep 3 days of stats
             del st["_stats"][d]
         for hkey in sorted(st.get("_hourly", {}))[:-48]:  # keep 48 hours
             del st["_hourly"][hkey]
-        with open(state_file(g), "w") as f:
-            json.dump(st, f)
+        to_save.append(g)
+    if to_save:
+        save_states(states, to_save)
     print("--- done ---")
 
 

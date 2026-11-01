@@ -318,18 +318,35 @@ def check_amazon_api():
     return "OUT", price, f"no Amazon offer ({stock_en})", 1
 
 
+def webapi_problem(r):
+    """Oxylabs error body -> 'HTTP 400 TITLE: detail [#/field: reason]'."""
+    try:
+        d = r.json()
+        fields = "; ".join(f"{e.get('pointer')}: {e.get('detail')}" for e in d.get("errors") or [])
+        return (f"HTTP {r.status_code} {d.get('title')}: {d.get('detail')}"
+                + (f" [{fields}]" if fields else ""))[:300]
+    except Exception:
+        return f"HTTP {r.status_code}: {r.text[:200]}"
+
+
 def check_amazon_webapi():
     """Amazon via Oxylabs Web API. Returns status, price, note, billed(0/1)."""
     key = OXY_WEB_API_KEY if OXY_WEB_API_KEY.lower().startswith("bearer ") else f"Bearer {OXY_WEB_API_KEY}"
-    payload = {"url": f"{AMAZON_URL}?th=1&psc=1", "output": ["html"],
-               "run_js": False, "location": "DE"}
-    r = requests.post(OXY_WEB_API_URL, json=payload, timeout=120,
-                      headers={"Content-Type": "application/json", "Authorization": key,
-                               "User-Agent": "ps5-stock-checker"})
+    headers = {"Content-Type": "application/json", "Authorization": key,
+               "User-Agent": "ps5-stock-checker"}
+    full = {"url": f"{AMAZON_URL}?th=1&psc=1", "output": ["html"],
+            "run_js": False, "location": "DE"}
+    minimal = {"url": AMAZON_URL, "location": "DE"}  # html is the default output
+    r = None
+    for payload in (full, minimal):
+        r = requests.post(OXY_WEB_API_URL, json=payload, timeout=150, headers=headers)
+        if r.status_code != 400:
+            break
+        print(f"Web API rejected the request: {webapi_problem(r)}")
     if r.status_code == 401:
         return "ERROR", None, "Web API: key rejected (check OXY_WEB_API_KEY)", 0
-    if r.status_code != 200:
-        return "BLOCKED", None, f"Web API HTTP {r.status_code}: {r.text[:120]}", 0
+    if r.status_code not in (200, 201):
+        return "BLOCKED", None, f"Web API {webapi_problem(r)}", 0
     try:
         data = r.json()
     except ValueError:
@@ -932,7 +949,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 31) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 32) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

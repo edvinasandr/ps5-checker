@@ -431,10 +431,16 @@ def parse_amazon_page(t, info, trusted_location):
     loc = ""
     i = t.find('id="glow-ingress-line1"')
     if i >= 0:
-        loc = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", t[i:i + 400])))
-        loc = loc.split(">", 1)[-1].split("Standort")[0].strip()
-    german = bool(re.match(r"Lieferung an .+\b\d{5}\b", loc))
-    loc_en = re.sub(r"^Lieferung (an|nach)\s*", "", loc)[:35] or "unknown"
+        raw = t[i:i + 1000].split(">", 1)[-1]
+        raw = re.sub(r"<[^>]*>", " ", raw)          # complete tags
+        raw = re.sub(r"<[^>]*$", " ", raw)          # a tag cut off at the end
+        raw = re.sub(r"[\u200b-\u200f\u2060\ufeff]", "", html.unescape(raw))  # invisible chars
+        loc = re.sub(r"\s+", " ", raw).split("Standort")[0].strip()
+    # German formats seen: "Lieferung an Berlin 10115", "Liefern nach 10115 Berlin".
+    # A foreign visitor gets a country name instead ("Lieferung nach Vereinigte Staaten").
+    german = bool(re.match(r"(?:Lieferung an|Liefern an|Liefern nach|Lieferung nach)\s.*\b\d{5}\b", loc)) \
+        or AMAZON_POSTCODE in loc
+    loc_en = re.sub(r"^(?:Lieferung|Liefern) (?:an|nach)\s*", "", loc)[:35] or "unknown"
     if not german and not trusted_location:
         return "BLOCKED", None, f"page not for Germany (delivery to: {loc_en})"
 
@@ -971,7 +977,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 35) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 36) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

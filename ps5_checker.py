@@ -44,6 +44,8 @@ AMAZON_POSTCODE = "10115"  # German "deliver to" address for the API (Berlin)
 # returns its HTML, which is then read by the normal Amazon page check.
 OXY_WEB_API_KEY = (os.environ.get("OXY_WEB_API_KEY") or "").strip()
 OXY_WEB_API_URL = "https://webapi.oxylabs.io/v1/scrape"
+# Dedicated Amazon scraper: accepts a German postcode as location
+OXY_WEB_API_AMAZON_URL = "https://webapi.oxylabs.io/v1/scrape/amazon/product"
 MEDIAMARKT_URL = "https://www.mediamarkt.de/de/product/_sony-playstationr5-pro-2-tb-konsole-3018022.html"
 # Saturn belongs to MediaMarkt and uses the same product number and page layout:
 SATURN_URL = "https://www.saturn.de/de/product/_sony-playstationr5-pro-2-tb-konsole-3018022.html"
@@ -255,34 +257,11 @@ def log_history(ts, store, event, price, minutes=""):
 # ----------------------------------------------------------------- checks ---
 # Each returns (status, price, note); status: IN_STOCK | OUT | BLOCKED | ERROR
 
-def check_amazon_api():
-    """Amazon via Oxylabs Web Scraper API. Returns status, price, note, billed(0/1)."""
-    payload = {
-        "source": "amazon_product",
-        "domain": "de",
-        "query": AMAZON_ASIN,
-        "geo_location": AMAZON_POSTCODE,
-        "parse": True,
-        # accurate buy box data for the exact variant (adds th=1&psc=1)
-        "context": [{"key": "autoselect_variant", "value": True}],
-    }
-    r = requests.post(OXY_API_URL, json=payload, auth=(OXY_API_USER, OXY_API_PASS),
-                      timeout=90)
-    if r.status_code == 401:
-        return "ERROR", None, "Scraper API: wrong OXY_API_USER / OXY_API_PASS", 0
-    if r.status_code != 200:
-        return "BLOCKED", None, f"Scraper API HTTP {r.status_code}: {r.text[:120]}", 0
-    try:
-        res = (r.json().get("results") or [{}])[0]
-    except ValueError:
-        return "ERROR", None, "Scraper API: response was not JSON", 0
-    c = res.get("content")
-    if res.get("status_code") not in (200, None) or not isinstance(c, dict):
-        return "BLOCKED", None, f"Scraper API: no product data (status {res.get('status_code')})", 0
-
+def interpret_amazon_json(c):
+    """Oxylabs parsed Amazon product fields -> status, price, note."""
     title = str(c.get("title") or c.get("product_name") or "")
     if not EXPECTED_NAME.search(title.replace("®", "")):
-        return "ERROR", None, f"Scraper API: wrong product '{title[:40]}'", 1
+        return "ERROR", None, f"wrong product '{title[:40]}'"
 
     stock = str(c.get("stock") or "")
     pb = c.get("price_buybox")
@@ -312,10 +291,39 @@ def check_amazon_api():
     else:
         stock_en = stock[:40] or "no stock info"
     if has_buybox and sold_by_amazon:
-        return "IN_STOCK", price, f"buy box sold by Amazon ({stock_en})", 1
+        return "IN_STOCK", price, f"buy box sold by Amazon ({stock_en})"
     if has_buybox:
-        return "OUT", price, f"buy box, but seller is {seller_text[:40]}", 1
-    return "OUT", price, f"no Amazon offer ({stock_en})", 1
+        return "OUT", price, f"buy box, but seller is {seller_text[:40]}"
+    return "OUT", price, f"no Amazon offer ({stock_en})"
+
+
+def check_amazon_api():
+    """Amazon via Oxylabs Web Scraper API. Returns status, price, note, billed(0/1)."""
+    payload = {
+        "source": "amazon_product",
+        "domain": "de",
+        "query": AMAZON_ASIN,
+        "geo_location": AMAZON_POSTCODE,
+        "parse": True,
+        # accurate buy box data for the exact variant (adds th=1&psc=1)
+        "context": [{"key": "autoselect_variant", "value": True}],
+    }
+    r = requests.post(OXY_API_URL, json=payload, auth=(OXY_API_USER, OXY_API_PASS),
+                      timeout=90)
+    if r.status_code == 401:
+        return "ERROR", None, "Scraper API: wrong OXY_API_USER / OXY_API_PASS", 0
+    if r.status_code != 200:
+        return "BLOCKED", None, f"Scraper API HTTP {r.status_code}: {r.text[:120]}", 0
+    try:
+        res = (r.json().get("results") or [{}])[0]
+    except ValueError:
+        return "ERROR", None, "Scraper API: response was not JSON", 0
+    c = res.get("content")
+    if res.get("status_code") not in (200, None) or not isinstance(c, dict):
+        return "BLOCKED", None, f"Scraper API: no product data (status {res.get('status_code')})", 0
+
+    status, price, note = interpret_amazon_json(c)
+    return status, price, note, 1
 
 
 def webapi_problem(r):
@@ -336,14 +344,21 @@ def check_amazon_webapi():
                "User-Agent": "ps5-stock-checker"}
     # Oxylabs rejects both "DE" and a German postcode as location for Amazon,
     # so no location is sent; the page's delivery address is checked instead.
-    full = {"url": f"{AMAZON_URL}?th=1&psc=1", "output": ["html"], "run_js": False}
-    minimal = {"url": AMAZON_URL}  # html is the default output
+    # 1st choice: dedicated Amazon scraper with a German postcode (Berlin).
+    # 2nd: generic page scrape without location (Oxylabs picks the exit IP).
+    attempts = [
+        (OXY_WEB_API_AMAZON_URL, {"query": AMAZON_ASIN, "domain": "de", "location": AMAZON_POSTCODE,
+                                  "currency": "EUR", "output": ["html", "json"]}),
+        (OXY_WEB_API_AMAZON_URL, {"query": AMAZON_ASIN, "domain": "de", "location": AMAZON_POSTCODE,
+                                  "currency": "EUR", "output": ["json"]}),
+        (OXY_WEB_API_URL, {"url": f"{AMAZON_URL}?th=1&psc=1", "output": ["html"], "run_js": False}),
+    ]
     r = None
-    for payload in (full, minimal):
-        r = requests.post(OXY_WEB_API_URL, json=payload, timeout=150, headers=headers)
-        if r.status_code != 400:
+    for url, payload in attempts:
+        r = requests.post(url, json=payload, timeout=150, headers=headers)
+        if r.status_code in (200, 201) or r.status_code == 401:
             break
-        print(f"Web API rejected the request: {webapi_problem(r)}")
+        print(f"Web API ({url.rsplit('/v1/', 1)[-1]}) not usable: {webapi_problem(r)}")
     if r.status_code == 401:
         return "ERROR", None, "Web API: key rejected (check OXY_WEB_API_KEY)", 0
     if r.status_code not in (200, 201):
@@ -353,15 +368,20 @@ def check_amazon_webapi():
     except ValueError:
         return "ERROR", None, "Web API: response was not JSON", 0
     res = (data.get("results") or [{}])[0] if isinstance(data, dict) else {}
+    endpoint = "amazon scraper" if "/amazon/" in r.url else "page scrape"
     page = res.get("html") or res.get("content") or ""
     if isinstance(page, list):
         page = "".join(str(x) for x in page)
-    if not page:
-        return "ERROR", None, f"Web API: no html in response (keys: {list(res)[:8]})", 0
-    # trusted_location=False: only accept the page if it shows a German delivery address
-    status, price, note = parse_amazon_page(str(page), f"Web API, {len(page) // 1024} KB",
-                                            trusted_location=False)
-    return status, price, note, 1
+    if page:
+        # Only accepted if the page shows a German delivery address
+        status, price, note = parse_amazon_page(
+            str(page), f"Web API {endpoint}, {len(page) // 1024} KB", trusted_location=False)
+        return status, price, note, 1
+    parsed = res.get("json")
+    if isinstance(parsed, dict) and parsed:
+        status, price, note = interpret_amazon_json(parsed)
+        return status, price, f"{note}; Web API {endpoint} (parsed data)", 1
+    return "ERROR", None, f"Web API: no html or json in response (keys: {list(res)[:8]})", 1
 
 
 def check_amazon(s):
@@ -951,7 +971,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 34) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 35) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

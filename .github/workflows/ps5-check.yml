@@ -50,6 +50,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           OXYLABS_USER: ${{ secrets.OXYLABS_USER }}
           OXYLABS_PASS: ${{ secrets.OXYLABS_PASS }}
+          OXY_API_USER: ${{ secrets.OXY_API_USER }}
+          OXY_API_PASS: ${{ secrets.OXY_API_PASS }}
+          OXY_WEB_API_KEY: ${{ secrets.OXY_WEB_API_KEY }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           PSDIRECT_URL: ${{ vars.PSDIRECT_URL }}

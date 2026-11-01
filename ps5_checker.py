@@ -334,9 +334,10 @@ def check_amazon_webapi():
     key = OXY_WEB_API_KEY if OXY_WEB_API_KEY.lower().startswith("bearer ") else f"Bearer {OXY_WEB_API_KEY}"
     headers = {"Content-Type": "application/json", "Authorization": key,
                "User-Agent": "ps5-stock-checker"}
+    # For Amazon, Oxylabs wants a postal code inside Germany, not "DE"
     full = {"url": f"{AMAZON_URL}?th=1&psc=1", "output": ["html"],
-            "run_js": False, "location": "DE"}
-    minimal = {"url": AMAZON_URL, "location": "DE"}  # html is the default output
+            "run_js": False, "location": AMAZON_POSTCODE}
+    minimal = {"url": AMAZON_URL, "location": AMAZON_POSTCODE}  # html is the default output
     r = None
     for payload in (full, minimal):
         r = requests.post(OXY_WEB_API_URL, json=payload, timeout=150, headers=headers)
@@ -949,7 +950,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 32) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 33) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

@@ -334,10 +334,10 @@ def check_amazon_webapi():
     key = OXY_WEB_API_KEY if OXY_WEB_API_KEY.lower().startswith("bearer ") else f"Bearer {OXY_WEB_API_KEY}"
     headers = {"Content-Type": "application/json", "Authorization": key,
                "User-Agent": "ps5-stock-checker"}
-    # For Amazon, Oxylabs wants a postal code inside Germany, not "DE"
-    full = {"url": f"{AMAZON_URL}?th=1&psc=1", "output": ["html"],
-            "run_js": False, "location": AMAZON_POSTCODE}
-    minimal = {"url": AMAZON_URL, "location": AMAZON_POSTCODE}  # html is the default output
+    # Oxylabs rejects both "DE" and a German postcode as location for Amazon,
+    # so no location is sent; the page's delivery address is checked instead.
+    full = {"url": f"{AMAZON_URL}?th=1&psc=1", "output": ["html"], "run_js": False}
+    minimal = {"url": AMAZON_URL}  # html is the default output
     r = None
     for payload in (full, minimal):
         r = requests.post(OXY_WEB_API_URL, json=payload, timeout=150, headers=headers)
@@ -358,8 +358,9 @@ def check_amazon_webapi():
         page = "".join(str(x) for x in page)
     if not page:
         return "ERROR", None, f"Web API: no html in response (keys: {list(res)[:8]})", 0
+    # trusted_location=False: only accept the page if it shows a German delivery address
     status, price, note = parse_amazon_page(str(page), f"Web API, {len(page) // 1024} KB",
-                                            trusted_location=True)
+                                            trusted_location=False)
     return status, price, note, 1
 
 
@@ -415,7 +416,7 @@ def parse_amazon_page(t, info, trusted_location):
     german = bool(re.match(r"Lieferung an .+\b\d{5}\b", loc))
     loc_en = re.sub(r"^Lieferung (an|nach)\s*", "", loc)[:35] or "unknown"
     if not german and not trusted_location:
-        return "BLOCKED", None, f"direct page not for Germany (delivery to: {loc_en})"
+        return "BLOCKED", None, f"page not for Germany (delivery to: {loc_en})"
 
     has_cart = 'id="add-to-cart-button"' in t or 'id="buy-now-button"' in t
 
@@ -950,7 +951,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 33) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 34) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

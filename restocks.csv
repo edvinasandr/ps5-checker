@@ -67,3 +67,4 @@ time_vilnius,store,event,price_eur,minutes_in_stock
 2026-11-05 12:26,MediaMarkt.de,IN_STOCK,899.99,
 2026-11-05 12:26,Saturn.de,IN_STOCK,899.99,
 2026-11-05 12:28,MediaMarkt.de,SOLD_OUT,899.99,2
+2026-11-05 12:29,Saturn.de,SOLD_OUT,899.99,3

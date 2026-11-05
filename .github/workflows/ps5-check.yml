@@ -57,6 +57,9 @@ jobs:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           PSDIRECT_URL: ${{ vars.PSDIRECT_URL }}
           MAX_PRICE: "900"
+          FREE_EVERY_MIN: "2"     # must match the free cron job on cron-job.org
+          PROXY_EVERY_MIN: "5"    # must match the proxy cron job on cron-job.org
+          AMAZON_EVERY_MIN: "5"   # Amazon interval (at least the proxy interval)
           STORE_GROUP: ${{ env.GROUP }}
           TEST_ALERT: ${{ inputs.test_alert }}
           DEBUG: ${{ inputs.debug }}

@@ -66,7 +66,7 @@ STORE_GROUP = (os.environ.get("STORE_GROUP") or "all").strip().lower()
 SUMMARY_HOUR = 8  # daily report is sent by the first proxy/all run after 08:00
 # Your cron-job.org schedule, used to work out how many checks *should* happen
 EVERY_MIN = {"free": int(os.environ.get("FREE_EVERY_MIN", "2")),
-             "proxy": int(os.environ.get("PROXY_EVERY_MIN", "1"))}
+             "proxy": int(os.environ.get("PROXY_EVERY_MIN", "5"))}
 # Optional slower interval for single stores, e.g. AMAZON_EVERY_MIN=3 checks Amazon
 # only at minutes divisible by 3 (Amazon is the costly Web API request).
 STORE_EVERY_MIN = {"Amazon.de": int(os.environ.get("AMAZON_EVERY_MIN") or 0)}
@@ -220,16 +220,32 @@ ALERT_REPEAT = int(os.environ.get("ALERT_REPEAT", "5"))
 ALERT_GAP_SEC = float(os.environ.get("ALERT_GAP_SEC", "3"))
 
 
-def alert(store, price, link, last_restock=None):
+# A store showing stock again within this many minutes counts as "flapping"
+FLAP_MIN = int(os.environ.get("FLAP_MIN", "30"))
+
+
+def stock_qty(note):
+    m = re.search(r"\bstock: (\d+)", note or "")
+    return int(m.group(1)) if m else None
+
+
+def alert(store, price, link, last_restock=None, qty=None, repeat=None):
     p = f"€{price:.2f}" if price else "unknown"
     last = f"\n<b>Last restock here:</b> {last_restock}" if last_restock else ""
+    q = f"\n<b>Stock:</b> {qty} unit{'s' if qty != 1 else ''}" if qty is not None else ""
+    if repeat:
+        # Flapping: one message instead of five
+        buy = f"<a href=\"{html.escape(link)}\">Buy now</a>"
+        send_telegram(f"🔁 <b>{html.escape(store)}</b> shows stock again "
+                      f"(#{repeat} in {FLAP_MIN} min, often phantom stock). Price: {p}{q}\n{buy}")
+        return
     buy = (f"<a href=\"{html.escape(link)}\">Buy now</a>"
            + "".join(f"  |  <a href=\"{html.escape(u)}\">🛒 Add to cart</a>"
                      for k, u in CART_LINKS.items() if store.startswith(k)))
     send_telegram(
         f"🚨 <b>PS5 Pro IN STOCK!</b> 🚨\n"
         f"<b>Store:</b> {html.escape(store)}\n"
-        f"<b>Price:</b> {p}{last}\n" + buy
+        f"<b>Price:</b> {p}{q}{last}\n" + buy
     )
     # Repeat a short version so the phone buzzes several times
     for i in range(2, ALERT_REPEAT + 1):
@@ -238,9 +254,19 @@ def alert(store, price, link, last_restock=None):
                       f"<b>{html.escape(store)}</b>! {buy}")
 
 
-def sold_out_alert(store, minutes):
-    send_telegram(f"❌ <b>{html.escape(store)}</b>: sold out again "
-                  f"(was in stock for about {minutes} min)")
+# Messages about state changes (sold out, warnings, recovery) are queued and only
+# sent after the new state has been saved; otherwise a failed save would make
+# every following run send the same message again.
+AFTER_SAVE = []
+
+
+def send_after_save(text, silent=False):
+    AFTER_SAVE.append((text, silent))
+
+
+def sold_out_alert(store, minutes, silent=False):
+    send_after_save(f"❌ <b>{html.escape(store)}</b>: sold out again "
+                    f"(was in stock for about {minutes} min)", silent=silent)
 
 
 def now_str():
@@ -461,13 +487,20 @@ def parse_amazon_page(t, info, trusted_location):
         m = re.search(r'class="a-offscreen">([^<]+)<', t[j:j + 3000])
         price = parse_eur(m.group(1)) if m else None
 
+    # Only look inside the PS5 Pro's own buy box area: further down, the page has
+    # recommended products with their own "Nur noch 19 auf Lager".
+    b = t.find('id="buybox"')
+    e = t.find('id="feature-bullets"', b) if b >= 0 else -1
+    region = t[b:e] if b >= 0 and e > b else (t[b:b + 150_000] if b >= 0 else "")
+    m = re.search(r"(?i)nur noch (\d+)\s*(?:Stück\s*)?(?:auf Lager|vorrätig)|only (\d+) left in stock", region)
+    qty = f"stock: {m.group(1) or m.group(2)}; " if m else ""
     if has_cart and sold_by_amazon:
-        return "IN_STOCK", price, f"buy button, sold by Amazon; delivery to {loc_en}"
+        return "IN_STOCK", price, f"buy button, sold by Amazon; {qty}delivery to {loc_en}"
     if has_cart:
         why = "buy button, but seller is not Amazon"
     else:
         why = "no buy button"
-    return "OUT", price, f"{why}; delivery to {loc_en}; {info}"
+    return "OUT", price, f"{why}; {qty}delivery to {loc_en}; {info}"
 
 
 def parse_jsonld(text):
@@ -507,7 +540,11 @@ def parse_jsonld(text):
             if not EXPECTED_NAME.search(full_name):
                 return "ERROR", price, f"wrong product on page: '{name}'"
             status = "IN_STOCK" if short in BUYABLE else "OUT"
-            return status, price, f"{AVAIL_EN.get(short, short)}, product verified"
+            inv = offers.get("inventoryLevel")
+            if isinstance(inv, dict):
+                inv = inv.get("value")
+            qty = f", stock: {int(float(inv))}" if isinstance(inv, (int, float, str)) and str(inv).replace(".", "", 1).isdigit() else ""
+            return status, price, f"{AVAIL_EN.get(short, short)}{qty}, product verified"
     return None
 
 
@@ -598,7 +635,7 @@ def check_expert(s):
             if price:
                 break
     in_stock = online > 0 or "CART" in action.upper() or "BUY" in action.upper()
-    return ("IN_STOCK" if in_stock else "OUT"), price, f"{'in stock' if in_stock else 'out of stock'} (online stock: {online}, button: {action.lower()})"
+    return ("IN_STOCK" if in_stock else "OUT"), price, f"{'in stock' if in_stock else 'out of stock'} (stock: {online}, button: {action.lower()})"
 
 
 def mueller_done(t):
@@ -682,6 +719,29 @@ def load_all_states():
     """Returns ({group: state}, {group: loaded_ok}). Never raises."""
     raw, ok = {}, {}
     if GIST_ID and GIST_TOKEN:
+        raw, ok = load_from_gist()
+    else:
+        print("No storage configured: using local state files")
+        for g in GROUPS:
+            try:
+                with open(state_file(g)) as f:
+                    raw[g] = f.read()
+            except FileNotFoundError:
+                raw[g] = "{}"
+            ok[g] = True
+    states = {}
+    for g in GROUPS:
+        try:
+            st = json.loads(raw[g] or "{}")
+        except json.JSONDecodeError:
+            st = {}
+        states[g] = {k: (v if isinstance(v, dict) else {"status": v}) for k, v in st.items()}
+    return states, ok
+
+
+def load_from_gist():
+    raw, ok = {}, {}
+    if True:
         try:
             r = requests.get(GIST_API, headers=gist_headers(), timeout=15)
             if r.status_code != 200:
@@ -702,39 +762,26 @@ def load_all_states():
             print(f"Could not load state from Gist: {str(e)[:150]}")
             for g in GROUPS:
                 raw[g], ok[g] = "{}", False
-    else:
-        print("GIST_ID / GIST_TOKEN not set: using local state files")
-        for g in GROUPS:
-            try:
-                with open(state_file(g)) as f:
-                    raw[g] = f.read()
-            except FileNotFoundError:
-                raw[g] = "{}"
-            ok[g] = True
-    states = {}
-    for g in GROUPS:
-        try:
-            st = json.loads(raw[g] or "{}")
-        except json.JSONDecodeError:
-            st = {}
-        states[g] = {k: (v if isinstance(v, dict) else {"status": v}) for k, v in st.items()}
-    return states, ok
+    return raw, ok
 
 
 def save_states(states, groups):
-    """Writes only the given groups' files, so the two groups never overwrite each other."""
+    """Writes only the given groups' state, so the two groups never overwrite each other.
+    Returns True if saved."""
     if GIST_ID and GIST_TOKEN:
         payload = {"files": {state_file(g): {"content": json.dumps(states[g])} for g in groups}}
         try:
             r = requests.patch(GIST_API, headers=gist_headers(), json=payload, timeout=15)
             if r.status_code != 200:
                 raise Exception(gist_error(r))
+            return True
         except Exception as e:
             print(f"Could not save state to Gist: {str(e)[:150]}")
-    else:
-        for g in groups:
-            with open(state_file(g), "w") as f:
-                json.dump(states[g], f)
+            return False
+    for g in groups:
+        with open(state_file(g), "w") as f:
+            json.dump(states[g], f)
+    return True
 
 
 def day_stats(state, day):
@@ -780,13 +827,24 @@ def handle_result(name, link, status, price, note, st, ts):
     prev = st.get("status")
 
     if status == "IN_STOCK" and prev != "IN_STOCK":
-        alert(name, price, link, st.get("last_restock"))
+        qty = stock_qty(note)
+        last_loud = st.get("last_loud_alert")
+        flapping = last_loud and minutes_between(last_loud, ts) < FLAP_MIN
+        if flapping:
+            st["flaps"] = st.get("flaps", 1) + 1
+            alert(name, price, link, qty=qty, repeat=st["flaps"])
+            print(f"[{name}] 🔁 stock again (flap #{st['flaps']}), single message sent")
+        else:
+            st["flaps"] = 1
+            st["last_loud_alert"] = ts
+            alert(name, price, link, st.get("last_restock"), qty=qty)
+            print(f"[{name}] 🚨 ALERT SENT")
         log_history(ts, name, "IN_STOCK", price)
         st["last_restock"] = ts
-        print(f"[{name}] 🚨 ALERT SENT")
     elif status == "OUT" and prev == "IN_STOCK":
         mins = minutes_between(st.get("last_restock", ts), ts)
-        sold_out_alert(name, mins)
+        last_loud = st.get("last_loud_alert")
+        sold_out_alert(name, mins, silent=bool(last_loud and minutes_between(last_loud, ts) < FLAP_MIN))
         log_history(ts, name, "SOLD_OUT", price, mins)
         st["last_sold_out"] = ts
         print(f"[{name}] sold out again after ~{mins} min")
@@ -795,7 +853,7 @@ def handle_result(name, link, status, price, note, st, ts):
     if ok:  # never overwrite the stock status on errors
         st["status"] = status
         if st.get("fail_warned"):
-            send_telegram(f"✅ <b>{html.escape(name)}</b>: checking works again.")
+            send_after_save(f"✅ <b>{html.escape(name)}</b>: checking works again.")
         for k in ("fails", "fail_since", "fail_warned"):
             st.pop(k, None)
     else:
@@ -804,7 +862,7 @@ def handle_result(name, link, status, price, note, st, ts):
         down = minutes_between(st["fail_since"], ts)
         print(f"[{name}] failing for {st['fails']} run(s) / {down} min")
         if not st.get("fail_warned") and st["fails"] >= 3 and down >= FAIL_WARN_MIN:
-            send_telegram(
+            send_after_save(
                 f"⚠️ <b>{html.escape(name)}</b>: could not be checked for {down} min "
                 f"({st['fails']} runs). You may miss a restock there.\n"
                 f"Last error: {html.escape(note[:150])}")
@@ -985,7 +1043,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 37) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 41) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:
@@ -1053,8 +1111,13 @@ def main():
         for hkey in sorted(st.get("_hourly", {}))[:-48]:  # keep 48 hours
             del st["_hourly"][hkey]
         to_save.append(g)
-    if to_save:
-        save_states(states, to_save)
+    saved = save_states(states, to_save) if to_save else False
+    if saved:
+        for text, silent in AFTER_SAVE:
+            send_telegram(text, silent=silent)
+    elif AFTER_SAVE:
+        print(f"{len(AFTER_SAVE)} status message(s) held back: state not saved, "
+              "they will be sent once saving works again")
     print("--- done ---")
 
 

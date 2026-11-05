@@ -13,6 +13,7 @@ import random
 import time
 import re
 import urllib.parse
+import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -229,10 +230,12 @@ def stock_qty(note):
     return int(m.group(1)) if m else None
 
 
-def alert(store, price, link, last_restock=None, qty=None, repeat=None):
+def alert(store, price, link, last_restock=None, qty=None, repeat=None, confirmed=False):
     p = f"€{price:.2f}" if price else "unknown"
     last = f"\n<b>Last restock here:</b> {last_restock}" if last_restock else ""
     q = f"\n<b>Stock:</b> {qty} unit{'s' if qty != 1 else ''}" if qty is not None else ""
+    if confirmed:
+        q += "\n✅ <b>Cart confirms delivery is possible</b>"
     if repeat:
         # Flapping: one message instead of five
         buy = f"<a href=\"{html.escape(link)}\">Buy now</a>"
@@ -577,6 +580,108 @@ def check_psdirect(s):
     return "ERROR", None, f"no stock data on page; {info}"
 
 
+# --- MediaMarkt / Saturn cart check -------------------------------------------
+# The product page can say "in stock" while no warehouse can ship it (phantom
+# stock). When the page shows stock, the PS5 Pro is put into a fresh, anonymous,
+# throwaway cart (1 unit, never logged in, never checked out) and the cart's
+# DELIVERY status is read. MediaMarkt doesn't reserve stock in the cart.
+MMS_PRODUCT_ID = "3018022"
+MMS_CART_CHECK = os.environ.get("MMS_CART_CHECK", "true") == "true"
+MMS_CLIENT_VERSION = "8.532.1"
+MMS_ADD_HASH = "660441ec5b7081ed1b9733a50a5fe25441e4ad53562f4cdff421d3e620b9dd30"
+MMS_BASKET_HASH = "a87a1f454d2b2f93fc917e7977a4c70c4a6aecc7b81007444720410f2d511ef4"
+MMS_SHOPS = {"mediamarkt": ("https://www.mediamarkt.de", "Media"),
+             "saturn": ("https://www.saturn.de", "Saturn")}
+
+
+def mms_headers(sales_line, operation):
+    return {"accept": "*/*", "content-type": "application/json",
+            "apollographql-client-name": "pwa-client-pqm",
+            "apollographql-client-version": MMS_CLIENT_VERSION,
+            "x-cacheable": "false", "x-flow-id": str(uuid.uuid4()),
+            "x-mms-country": "DE", "x-mms-language": "de",
+            "x-mms-salesline": sales_line, "x-operation": operation}
+
+
+def mms_pwa(sales_line):
+    return {"captureChannel": "DESKTOP", "salesLine": sales_line, "country": "DE",
+            "language": "de", "globalLoyaltyProgram": True, "isOneAccountProgramActive": True,
+            "shouldInactiveContractsBeHidden": True, "isUsingXccCustomerComponent": True,
+            "isCheckoutPhoneCompareActive": True}
+
+
+def mms_gql_error(d):
+    errs = d.get("errors") or []
+    if not errs:
+        return None
+    e = errs[0]
+    ext = e.get("extensions") or {}
+    return ext.get("code") or e.get("message") or "unknown error"
+
+
+def mms_cart_check(s, label, product_url):
+    """Returns ('YES' | 'NO' | 'UNKNOWN', detail)."""
+    base, line = MMS_SHOPS[label]
+    api = f"{base}/api/v1/graphql"
+    hdr_ref = {"referer": product_url, "origin": base}
+    # 1) add 1 unit to the session's (new, empty) cart
+    body = {"operationName": "AddProduct",
+            "variables": {"items": [{"outletId": None, "productId": MMS_PRODUCT_ID, "quantity": 1,
+                                     "serviceIds": None, "warrantyIds": None}]},
+            "extensions": {"persistedQuery": {"version": 1, "sha256Hash": MMS_ADD_HASH},
+                           "pwa": mms_pwa(line)}}
+    r = s.post(api, json=body, headers={**mms_headers(line, "AddProduct"), **hdr_ref})
+    count_bytes(s, len(r.content))
+    if r.status_code != 200 or "captcha" in r.text[:2000].lower():
+        return "UNKNOWN", f"add to cart: HTTP {r.status_code}"
+    try:
+        err = mms_gql_error(r.json())
+    except ValueError:
+        return "UNKNOWN", "add to cart: no JSON (maybe a bot check)"
+    if err and err != "BASKET_ITEM_MAX_QUANTITY":
+        return "UNKNOWN", f"add to cart: {err}"
+    # 2) read the cart
+    variables = {"isThankYouPage": False, "shouldUpdateLoyaltyPoints": False,
+                 "isCustomerBehaviorInfluenceActive": True,
+                 "cofrConfig": {"isEnabled": True, "baseDomain": base, "channel": "DESKTOP",
+                                "isLegacyDataExcluded": False,
+                                "features": {"delivery": {"isDeliveryStatusByEarliestDateEnabled": True,
+                                                          "isLocationSourcingEnabled": True,
+                                                          "isLocationSourcingMarketplaceEnabled": True},
+                                             "onlineStatus": {"isParallelRequestsEnabled": True,
+                                                              "isPermanentlyNaIndexEnabled": True}}}}
+    ext = {"persistedQuery": {"version": 1, "sha256Hash": MMS_BASKET_HASH}, "pwa": mms_pwa(line)}
+    q = urllib.parse.urlencode({"operationName": "GetBasket",
+                                "variables": json.dumps(variables, separators=(",", ":")),
+                                "extensions": json.dumps(ext, separators=(",", ":"))})
+    r = s.get(f"{api}?{q}", headers={**mms_headers(line, "GetBasket"), **hdr_ref})
+    count_bytes(s, len(r.content))
+    if r.status_code != 200:
+        return "UNKNOWN", f"read cart: HTTP {r.status_code}"
+    try:
+        d = r.json()
+    except ValueError:
+        return "UNKNOWN", "read cart: no JSON"
+    err = mms_gql_error(d)
+    if err and not (d.get("data") or {}).get("basket"):
+        return "UNKNOWN", f"read cart: {err}"
+    try:
+        groups = d["data"]["basket"]["content"]["checkout"]["mmsGroups"]["groups"]
+    except (KeyError, TypeError):
+        return "UNKNOWN", "read cart: unexpected format"
+    for g in groups or []:
+        for item in g.get("lineItems") or []:
+            if str(item.get("productId")) != MMS_PRODUCT_ID:
+                continue
+            ful = {f.get("method"): f.get("unavailableReason") for f in item.get("fulfillments") or []}
+            if "DELIVERY" not in ful:
+                return "UNKNOWN", f"no delivery option in cart ({', '.join(ful) or 'none'})"
+            if ful["DELIVERY"] is None:
+                return "YES", "cart: delivery possible"
+            return "NO", f"cart: delivery not possible ({ful['DELIVERY']})"
+    return "UNKNOWN", "PS5 Pro not found in cart"
+
+
 def check_mms(s, url, label):
     """MediaMarkt and Saturn share the same shop system."""
     r = fetch_until(s, url, mediamarkt_done, max_bytes=300_000)
@@ -584,9 +689,22 @@ def check_mms(s, url, label):
     if r.status_code != 200:
         return "BLOCKED", None, info
     res = parse_jsonld(r.text)
-    if res:
+    if not res:
+        return "ERROR", None, f"no product JSON-LD found; {info}"
+    status, price, note = res
+    if status != "IN_STOCK" or not MMS_CART_CHECK:
         return res
-    return "ERROR", None, f"no product JSON-LD found; {info}"
+    # The page says "in stock": ask the cart whether it can actually be shipped
+    try:
+        verdict, detail = mms_cart_check(s, label, url)
+    except Exception as e:
+        verdict, detail = "UNKNOWN", f"cart check failed: {str(e)[:100]}"
+    if verdict == "YES":
+        return "IN_STOCK", price, f"{note}; {detail} ✅"
+    if verdict == "NO":
+        return "PHANTOM", price, f"page says in stock, but {detail}"
+    # Unknown: better a possibly false alert than a missed restock
+    return "IN_STOCK", price, f"{note}; cart check unavailable ({detail})"
 
 
 def jsonld_offer_done(t):
@@ -821,6 +939,15 @@ def check_store(fn):
 
 
 def handle_result(name, link, status, price, note, st, ts):
+    if status == "PHANTOM":
+        # Page shows stock, but the cart can't ship it: not buyable, so no alarm
+        last = st.get("last_phantom_note")
+        if not last or minutes_between(last, ts) >= FLAP_MIN:
+            send_telegram(f"👻 <b>{html.escape(name)}</b>: page shows stock, but the cart says "
+                          f"it can't be delivered. Not buyable right now.", silent=True)
+            st["last_phantom_note"] = ts
+            log_history(ts, name, "PHANTOM", price)  # once per window, not every check
+        status = "OUT"
     if status == "IN_STOCK" and price and price > MAX_PRICE:
         print(f"[{name}] price {price} above MAX_PRICE, no alert")
         status = "OUT"
@@ -832,12 +959,12 @@ def handle_result(name, link, status, price, note, st, ts):
         flapping = last_loud and minutes_between(last_loud, ts) < FLAP_MIN
         if flapping:
             st["flaps"] = st.get("flaps", 1) + 1
-            alert(name, price, link, qty=qty, repeat=st["flaps"])
+            alert(name, price, link, qty=qty, repeat=st["flaps"], confirmed="✅" in note)
             print(f"[{name}] 🔁 stock again (flap #{st['flaps']}), single message sent")
         else:
             st["flaps"] = 1
             st["last_loud_alert"] = ts
-            alert(name, price, link, st.get("last_restock"), qty=qty)
+            alert(name, price, link, st.get("last_restock"), qty=qty, confirmed="✅" in note)
             print(f"[{name}] 🚨 ALERT SENT")
         log_history(ts, name, "IN_STOCK", price)
         st["last_restock"] = ts
@@ -1043,7 +1170,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 41) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 42) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

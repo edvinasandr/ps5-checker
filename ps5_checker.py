@@ -628,10 +628,9 @@ def list_ps_skus(t):
 def ps_test(url):
     """Manual test: read Sony's shop data from any product page and report it."""
     s = make_session(False)
-    r = fetch_until(s, url, lambda t: False, max_bytes=2_500_000,
-                    headers={"Referer": "https://www.playstation.com/de-de/"})
+    r, how = get_ps_page(s, url, lambda t: False)
     skus = list_ps_skus(r.text) if r.status_code == 200 else []
-    lines = ["🧪 <b>PlayStation test</b>"]
+    lines = ["🧪 <b>PlayStation test</b>" + (f" <i>({how})</i>" if how else "")]
     if r.status_code != 200:
         lines.append(f"⚠️ Page could not be loaded (HTTP {r.status_code})")
     elif not skus:
@@ -647,12 +646,54 @@ def ps_test(url):
     send_telegram(text)
 
 
+class WebApiPage:
+    """Minimal response object for a page fetched through the Oxylabs Web API."""
+    def __init__(self, status_code, text, url):
+        self.status_code, self.text, self.url, self.headers = status_code, text, url, {}
+
+
+def fetch_via_webapi(url):
+    """Fetch a page's HTML through the Oxylabs Web API from Germany (fallback when blocked)."""
+    if not OXY_WEB_API_KEY:
+        return None
+    key = OXY_WEB_API_KEY if OXY_WEB_API_KEY.lower().startswith("bearer ") else f"Bearer {OXY_WEB_API_KEY}"
+    r = requests.post(OXY_WEB_API_URL, timeout=120,
+                      json={"url": url, "output": ["html"], "run_js": False, "location": "DE"},
+                      headers={"Content-Type": "application/json", "Authorization": key,
+                               "User-Agent": "ps5-stock-checker"})
+    if r.status_code not in (200, 201):
+        print(f"Web API fallback failed: {webapi_problem(r)}")
+        return None
+    try:
+        res = (r.json().get("results") or [{}])[0]
+    except ValueError:
+        return None
+    page = res.get("html") or ""
+    if isinstance(page, list):
+        page = "".join(str(x) for x in page)
+    WEBAPI_USED[0] += 1
+    return WebApiPage(200, str(page), url) if page else None
+
+
+WEBAPI_USED = [0]  # Web API requests made as a fallback in this run
+
+
+def get_ps_page(s, url, done):
+    """Sony's page directly; through the Oxylabs Web API if Sony blocks GitHub (403)."""
+    r = fetch_until(s, url, done, max_bytes=1_800_000,
+                    headers={"Referer": "https://www.playstation.com/de-de/"})
+    if r.status_code == 403:
+        alt = fetch_via_webapi(url)
+        if alt:
+            return alt, "via Web API after Sony 403"
+    return r, ""
+
+
 def check_psdirect(s):
     if not PSDIRECT_URL.startswith("https://"):
         return "ERROR", None, f"bad PSDIRECT_URL: {PSDIRECT_URL!r}"
-    r = fetch_until(s, PSDIRECT_URL, ps_data_done, max_bytes=1_800_000,
-                    headers={"Referer": "https://www.playstation.com/de-de/"})
-    info = page_info("playstation", r)
+    r, how = get_ps_page(s, PSDIRECT_URL, ps_data_done)
+    info = page_info("playstation", r) + (f", {how}" if how else "")
     if r.status_code != 200:
         return "BLOCKED", None, f"HTTP {r.status_code} (final URL: {r.url})"
 
@@ -663,9 +704,10 @@ def check_psdirect(s):
     d = parse_ps_shop_data(r.text)
     if d:
         sig = f"override={d['override']}, highDemand={d['high_demand']}"
+        extra = f"; {how}" if how else ""
         if ps_in_stock(d["status"], d["override"]):
-            return "IN_STOCK", d["price"], f"shop data: {d['status']}; {sig}"
-        return "OUT", d["price"], f"shop data: {d['status']}; {sig}"
+            return "IN_STOCK", d["price"], f"shop data: {d['status']}; {sig}{extra}"
+        return "OUT", d["price"], f"shop data: {d['status']}; {sig}{extra}"
 
     # Fallback: the simple product data near the top of the page
     res = parse_jsonld(r.text)
@@ -767,12 +809,18 @@ def mms_cart_check(s, label, product_url):
         for item in g.get("lineItems") or []:
             if str(item.get("productId")) != MMS_PRODUCT_ID:
                 continue
-            ful = {f.get("method"): f.get("unavailableReason") for f in item.get("fulfillments") or []}
-            if "DELIVERY" not in ful:
-                return "UNKNOWN", f"no delivery option in cart ({', '.join(ful) or 'none'})"
-            if ful["DELIVERY"] is None:
-                return "YES", "cart: delivery possible"
-            return "NO", f"cart: delivery not possible ({ful['DELIVERY']})"
+            fl = {f.get("method"): f for f in item.get("fulfillments") or []}
+            if "DELIVERY" not in fl:
+                return "UNKNOWN", f"no delivery option in cart ({', '.join(fl) or 'none'})"
+            d = fl["DELIVERY"]
+            reason, promise = d.get("unavailableReason"), d.get("promise")
+            if reason:
+                return "NO", f"cart: delivery not possible ({reason})"
+            if promise:
+                # Only a delivery date promise counts as confirmed: an anonymous cart
+                # without an address leaves the reason empty even when nothing can ship.
+                return "YES", "cart: delivery date promised"
+            return "UNSURE", "cart gives no delivery date (no reason either)"
     return "UNKNOWN", "PS5 Pro not found in cart"
 
 
@@ -797,6 +845,8 @@ def check_mms(s, url, label):
         return "IN_STOCK", price, f"{note}; {detail} ✅"
     if verdict == "NO":
         return "PHANTOM", price, f"page says in stock, but {detail}"
+    if verdict == "UNSURE":
+        return "UNSURE", price, f"page says in stock, but {detail}"
     # Unknown: better a possibly false alert than a missed restock
     return "IN_STOCK", price, f"{note}; cart check unavailable ({detail})"
 
@@ -1034,6 +1084,17 @@ def check_store(fn):
 
 
 def handle_result(name, link, status, price, note, st, ts):
+    if status == "UNSURE":
+        # Page shows stock, the cart neither confirms nor refuses: one normal message,
+        # not the 5x alarm, at most once per flap window
+        last = st.get("last_unsure_note")
+        if not last or minutes_between(last, ts) >= FLAP_MIN:
+            send_telegram(f"🟡 <b>{html.escape(name)}</b>: page shows stock, but the cart can't confirm "
+                          f"a delivery date. Probably phantom stock; check yourself if you like: "
+                          f"<a href=\"{html.escape(link)}\">open page</a>")
+            st["last_unsure_note"] = ts
+            log_history(ts, name, "UNSURE", price)
+        status = "OUT"
     if status == "PHANTOM":
         # Page shows stock, but the cart can't ship it: not buyable, so no alarm
         last = st.get("last_phantom_note")
@@ -1285,7 +1346,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 46) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 48) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:
@@ -1295,6 +1356,7 @@ def main():
             continue  # this store has a slower interval and isn't due this minute
         before = PROXY_BYTES[0]
         api_n, done_by_api = 0, False
+        webapi_before = WEBAPI_USED[0]
         if fn is check_amazon:
             apis = []
             if OXY_API_USER and OXY_API_PASS:
@@ -1313,6 +1375,7 @@ def main():
                 print(f"[{name}] {note} -> trying next method")
         if not done_by_api:
             status, price, note, n_direct, n_proxy = check_store(fn)
+        api_n += WEBAPI_USED[0] - webapi_before
         print(f"[{name}] {status} price={price} ({note})")
         ok = handle_result(name, link, status, price, note, states[g].setdefault(name, {}), ts)
 

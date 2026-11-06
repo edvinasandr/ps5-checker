@@ -7,6 +7,7 @@ Restock history is appended to restocks.csv (committed by the workflow).
 """
 import csv
 import html
+import base64
 import json
 import os
 import random
@@ -235,7 +236,10 @@ def alert(store, price, link, last_restock=None, qty=None, repeat=None, confirme
     last = f"\n<b>Last restock here:</b> {last_restock}" if last_restock else ""
     q = f"\n<b>Stock:</b> {qty} unit{'s' if qty != 1 else ''}" if qty is not None else ""
     if confirmed:
-        q += "\n✅ <b>Cart confirms delivery is possible</b>"
+        # Show MediaMarkt's own answer, e.g. the promised delivery date
+        m = re.search(r"cart: ([^✅]+)", confirmed if isinstance(confirmed, str) else "")
+        detail = m.group(1).strip(" ;") if m else "delivery confirmed"
+        q += f"\n✅ <b>MediaMarkt cart:</b> {html.escape(detail[:160])}"
     if repeat:
         # Flapping: one message instead of five
         buy = f"<a href=\"{html.escape(link)}\">Buy now</a>"
@@ -726,6 +730,29 @@ MMS_CART_CHECK = os.environ.get("MMS_CART_CHECK", "true") == "true"
 MMS_CLIENT_VERSION = "8.532.1"
 MMS_ADD_HASH = "660441ec5b7081ed1b9733a50a5fe25441e4ad53562f4cdff421d3e620b9dd30"
 MMS_BASKET_HASH = "a87a1f454d2b2f93fc917e7977a4c70c4a6aecc7b81007444720410f2d511ef4"
+MMS_SETADDR_HASH = "fc07599b9591fbc06c793c3fb5f0a7a51a05818c9a55b42ee33b7a05770f2200"
+
+
+def mms_address():
+    """Delivery address from the MMS_ADDRESS secret: 'zip|street|housenumber|city'."""
+    parts = [p.strip() for p in (os.environ.get("MMS_ADDRESS") or "").split("|")]
+    if len(parts) != 4 or not all(parts):
+        return None
+    z, street, no, city = parts
+    return {"zipcode": z, "street": street, "houseNumber": no, "city": city, "country": "DE"}
+
+
+def real_dispatch(ref):
+    """True if a shippingOptionReference comes from real warehouse sourcing.
+    Without an address MediaMarkt sends 'e30=' (= '{}'), with real sourcing it
+    contains a dispatchDate."""
+    if not ref:
+        return False
+    try:
+        raw = base64.b64decode(ref + "=" * (-len(ref) % 4)).decode("utf-8", "ignore")
+    except Exception:
+        return False
+    return "dispatchDate" in raw
 MMS_SHOPS = {"mediamarkt": ("https://www.mediamarkt.de", "Media"),
              "saturn": ("https://www.saturn.de", "Saturn")}
 
@@ -776,35 +803,55 @@ def mms_cart_check(s, label, product_url):
         return "UNKNOWN", "add to cart: no JSON (maybe a bot check)"
     if err and err != "BASKET_ITEM_MAX_QUANTITY":
         return "UNKNOWN", f"add to cart: {err}"
-    # 2) read the cart
-    variables = {"isThankYouPage": False, "shouldUpdateLoyaltyPoints": False,
-                 "isCustomerBehaviorInfluenceActive": True,
-                 "cofrConfig": {"isEnabled": True, "baseDomain": base, "channel": "DESKTOP",
-                                "isLegacyDataExcluded": False,
-                                "features": {"delivery": {"isDeliveryStatusByEarliestDateEnabled": True,
-                                                          "isLocationSourcingEnabled": True,
-                                                          "isLocationSourcingMarketplaceEnabled": True},
-                                             "onlineStatus": {"isParallelRequestsEnabled": True,
-                                                              "isPermanentlyNaIndexEnabled": True}}}}
-    ext = {"persistedQuery": {"version": 1, "sha256Hash": MMS_BASKET_HASH}, "pwa": mms_pwa(line)}
-    q = urllib.parse.urlencode({"operationName": "GetBasket",
-                                "variables": json.dumps(variables, separators=(",", ":")),
-                                "extensions": json.dumps(ext, separators=(",", ":"))})
-    r = s.get(f"{api}?{q}", headers={**mms_headers(line, "GetBasket"), **hdr_ref})
+    try:
+        basket_id = (r.json().get("data") or {}).get("addProduct", {}).get("id")
+    except (ValueError, AttributeError):
+        basket_id = None
+    cofr = {"isEnabled": True, "baseDomain": base, "channel": "DESKTOP", "isLegacyDataExcluded": False,
+            "features": {"delivery": {"isDeliveryStatusByEarliestDateEnabled": True,
+                                      "isLocationSourcingEnabled": True,
+                                      "isLocationSourcingMarketplaceEnabled": True},
+                         "onlineStatus": {"isParallelRequestsEnabled": True,
+                                          "isPermanentlyNaIndexEnabled": True}}}
+    addr = mms_address()
+    if addr and basket_id:
+        # 2a) set the delivery address: only then does MediaMarkt source from a real warehouse
+        body = {"operationName": "SetAddress",
+                "variables": {"isCustomerBehaviorInfluenceActive": False, "basketId": basket_id,
+                              "shipping": addr, "cofrConfig": cofr},
+                "extensions": {"persistedQuery": {"version": 1, "sha256Hash": MMS_SETADDR_HASH},
+                               "pwa": mms_pwa(line)}}
+        r = s.post(api, json=body, headers={**mms_headers(line, "SetAddress"), **hdr_ref})
+        step = "set address"
+    else:
+        # 2b) no address: read the cart (gives only a generic estimate, see below)
+        variables = {"isThankYouPage": False, "shouldUpdateLoyaltyPoints": False,
+                     "isCustomerBehaviorInfluenceActive": True, "cofrConfig": cofr}
+        ext = {"persistedQuery": {"version": 1, "sha256Hash": MMS_BASKET_HASH}, "pwa": mms_pwa(line)}
+        q = urllib.parse.urlencode({"operationName": "GetBasket",
+                                    "variables": json.dumps(variables, separators=(",", ":")),
+                                    "extensions": json.dumps(ext, separators=(",", ":"))})
+        r = s.get(f"{api}?{q}", headers={**mms_headers(line, "GetBasket"), **hdr_ref})
+        step = "read cart"
     count_bytes(s, len(r.content))
     if r.status_code != 200:
-        return "UNKNOWN", f"read cart: HTTP {r.status_code}"
+        return "UNKNOWN", f"{step}: HTTP {r.status_code}"
     try:
         d = r.json()
     except ValueError:
-        return "UNKNOWN", "read cart: no JSON"
+        return "UNKNOWN", f"{step}: no JSON"
     err = mms_gql_error(d)
     if err and not (d.get("data") or {}).get("basket"):
-        return "UNKNOWN", f"read cart: {err}"
+        return "UNKNOWN", f"{step}: {err}"
+    return mms_cart_verdict(d, label, with_address=bool(addr and basket_id))
+
+
+def mms_cart_verdict(d, label, with_address):
     try:
-        groups = d["data"]["basket"]["content"]["checkout"]["mmsGroups"]["groups"]
+        checkout = d["data"]["basket"]["content"]["checkout"]
+        groups = checkout["mmsGroups"]["groups"]
     except (KeyError, TypeError):
-        return "UNKNOWN", "read cart: unexpected format"
+        return "UNKNOWN", "cart: unexpected format"
     for g in groups or []:
         for item in g.get("lineItems") or []:
             if str(item.get("productId")) != MMS_PRODUCT_ID:
@@ -812,15 +859,21 @@ def mms_cart_check(s, label, product_url):
             fl = {f.get("method"): f for f in item.get("fulfillments") or []}
             if "DELIVERY" not in fl:
                 return "UNKNOWN", f"no delivery option in cart ({', '.join(fl) or 'none'})"
-            d = fl["DELIVERY"]
-            reason, promise = d.get("unavailableReason"), d.get("promise")
+            reason, promise = fl["DELIVERY"].get("unavailableReason"), fl["DELIVERY"].get("promise")
+            ref = next((f.get("shippingOptionReference") for f in g.get("fulfillments") or []
+                        if f.get("method") == "DELIVERY"), None)
+            sourced = real_dispatch(ref)
+            print(f"[{label} cart] address={'yes' if with_address else 'no'} sourced={sourced} " + json.dumps(
+                {m: {"reason": f.get("unavailableReason"), "promise": f.get("promise")}
+                 for m, f in fl.items()}, ensure_ascii=False)[:600])
             if reason:
                 return "NO", f"cart: delivery not possible ({reason})"
-            if promise:
-                # Only a delivery date promise counts as confirmed: an anonymous cart
-                # without an address leaves the reason empty even when nothing can ship.
-                return "YES", "cart: delivery date promised"
-            return "UNSURE", "cart gives no delivery date (no reason either)"
+            if promise and sourced:
+                when = (promise.get("earliest") or "")[:10]
+                return "YES", f"cart: warehouse found, delivery {when}"
+            if not with_address:
+                return "UNSURE", "cart without address gives only a generic estimate (MMS_ADDRESS not set)"
+            return "UNSURE", "cart gives no real dispatch date"
     return "UNKNOWN", "PS5 Pro not found in cart"
 
 
@@ -1125,12 +1178,12 @@ def handle_result(name, link, status, price, note, st, ts):
         flapping = last_loud and minutes_between(last_loud, ts) < FLAP_MIN
         if flapping:
             st["flaps"] = st.get("flaps", 1) + 1
-            alert(name, price, link, qty=qty, repeat=st["flaps"], confirmed="✅" in note)
+            alert(name, price, link, qty=qty, repeat=st["flaps"], confirmed=note if "✅" in note else False)
             print(f"[{name}] 🔁 stock again (flap #{st['flaps']}), single message sent")
         else:
             st["flaps"] = 1
             st["last_loud_alert"] = ts
-            alert(name, price, link, st.get("last_restock"), qty=qty, confirmed="✅" in note)
+            alert(name, price, link, st.get("last_restock"), qty=qty, confirmed=note if "✅" in note else False)
             print(f"[{name}] 🚨 ALERT SENT")
         log_history(ts, name, "IN_STOCK", price)
         st["last_restock"] = ts
@@ -1346,7 +1399,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 48) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 51) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

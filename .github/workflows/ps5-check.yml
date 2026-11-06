@@ -18,6 +18,10 @@ on:
         description: "Test only: a PlayStation product page to read (no checks run)"
         type: string
         default: ""
+      mms_test_product:
+        description: "Test only: MediaMarkt/Saturn product number for a cart test (e.g. 2896393)"
+        type: string
+        default: ""
       test_alert:
         description: "Send a Telegram test message"
         type: boolean
@@ -70,6 +74,7 @@ jobs:
           DEBUG: ${{ inputs.debug }}
           REPORT: ${{ inputs.report }}
           PS_TEST_URL: ${{ inputs.ps_test_url }}
+          MMS_TEST_PRODUCT: ${{ inputs.mms_test_product }}
         run: python -u ps5_checker.py
 
       - name: Save restock history to repo

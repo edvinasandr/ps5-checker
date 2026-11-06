@@ -7,7 +7,7 @@ on:
       group:
         description: "Which stores to check"
         type: choice
-        options: [all, free, proxy]
+        options: [all, ps, free, mms, proxy]
         default: all
       report:
         description: "Only send a report to Telegram (no checks)"
@@ -31,7 +31,8 @@ on:
         type: boolean
         default: false
 
-# Each group runs one at a time; the two groups can run in parallel
+# Each group runs one at a time (a new PlayStation run waits for the running loop);
+# different groups run in parallel
 concurrency:
   group: ps5-${{ inputs.group || 'all' }}
   cancel-in-progress: false
@@ -42,7 +43,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 9   # the PlayStation loop runs ~5.5 min
     env:
       GROUP: ${{ inputs.group || 'all' }}
     steps:
@@ -66,8 +67,13 @@ jobs:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           PSDIRECT_URL: ${{ vars.PSDIRECT_URL }}
           MAX_PRICE: "900"
-          FREE_EVERY_MIN: "2"     # must match the free cron job on cron-job.org
-          PROXY_EVERY_MIN: "5"    # must match the proxy cron job on cron-job.org
+          # must match the cron jobs on cron-job.org
+          FREE_EVERY_MIN: "1"     # Alternate, Müller
+          MMS_EVERY_MIN: "2"      # MediaMarkt, Saturn
+          PROXY_EVERY_MIN: "5"    # Amazon, expert
+          PS_EVERY_SEC: "20"      # PlayStation check interval inside one run
+          PS_LOOP_SEC: "330"      # how long one PlayStation run keeps checking (cron: every 5 min)
+          PS_WEBAPI_MAX: "6"      # max Web API fallbacks per PlayStation run (after Sony 403s)
           AMAZON_EVERY_MIN: "5"   # Amazon interval (at least the proxy interval)
           STORE_GROUP: ${{ env.GROUP }}
           TEST_ALERT: ${{ inputs.test_alert }}

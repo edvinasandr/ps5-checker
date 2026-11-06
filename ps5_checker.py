@@ -877,6 +877,30 @@ def mms_cart_verdict(d, label, with_address):
     return "UNKNOWN", "PS5 Pro not found in cart"
 
 
+def mms_test(product_id):
+    """Manual test: run the full cart chain (add -> address -> warehouse) for any product."""
+    global MMS_PRODUCT_ID
+    real_id, MMS_PRODUCT_ID = MMS_PRODUCT_ID, product_id
+    lines = [f"🧪 <b>Cart test</b> with product {html.escape(product_id)}",
+             "Address: " + ("set ✅" if mms_address() else "⚠️ MMS_ADDRESS missing or wrong format")]
+    icons = {"YES": "✅ <b>CONFIRMED</b>", "NO": "❌ <b>NOT AVAILABLE</b>",
+             "UNSURE": "🟡 <b>NOT CONFIRMED</b>", "UNKNOWN": "⚠️ <b>CHECK FAILED</b>"}
+    try:
+        for label in ("mediamarkt", "saturn"):
+            base = MMS_SHOPS[label][0]
+            try:
+                verdict, detail = mms_cart_check(make_session(True), label,
+                                                 f"{base}/de/product/_test-{product_id}.html")
+            except Exception as e:
+                verdict, detail = "UNKNOWN", f"{type(e).__name__}: {e}"[:200]
+            lines.append(f"{label.capitalize()}: {icons.get(verdict, verdict)}\n<i>{html.escape(detail)}</i>")
+    finally:
+        MMS_PRODUCT_ID = real_id
+    text = "\n".join(lines)
+    print(re.sub(r"<[^>]+>", "", text))
+    send_telegram(text)
+
+
 def check_mms(s, url, label):
     """MediaMarkt and Saturn share the same shop system."""
     r = fetch_until(s, url, mediamarkt_done, max_bytes=300_000)
@@ -1374,6 +1398,11 @@ def main():
         sold_out_alert("Amazon.de (TEST)", 12)
         print("Test messages sent.")
 
+    mms_test_product = (os.environ.get("MMS_TEST_PRODUCT") or "").strip()
+    if mms_test_product:
+        mms_test(mms_test_product)
+        return
+
     ps_test_url = (os.environ.get("PS_TEST_URL") or "").strip()
     if ps_test_url:
         ps_test(ps_test_url)
@@ -1399,7 +1428,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 51) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 52) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

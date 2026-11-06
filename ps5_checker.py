@@ -2,7 +2,7 @@
 Alternate.de, expert.de
 Requires: pip install curl_cffi
 Env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, OXYLABS_USER, OXYLABS_PASS
-Optional: MAX_PRICE (default 900), STORE_GROUP (free | proxy | all)
+Optional: MAX_PRICE (default 900), STORE_GROUP (ps | free | mms | proxy | all)
 Restock history is appended to restocks.csv (committed by the workflow).
 """
 import csv
@@ -67,8 +67,15 @@ HISTORY_FILE = "restocks.csv"
 STORE_GROUP = (os.environ.get("STORE_GROUP") or "all").strip().lower()
 SUMMARY_HOUR = 8  # daily report is sent by the first proxy/all run after 08:00
 # Your cron-job.org schedule, used to work out how many checks *should* happen
-EVERY_MIN = {"free": int(os.environ.get("FREE_EVERY_MIN", "2")),
+EVERY_MIN = {"ps": 1,  # PlayStation runs as a loop, see PS_EVERY_SEC
+             "free": int(os.environ.get("FREE_EVERY_MIN", "1")),
+             "mms": int(os.environ.get("MMS_EVERY_MIN", "2")),
              "proxy": int(os.environ.get("PROXY_EVERY_MIN", "5"))}
+# PlayStation: one run stays alive for PS_LOOP_SEC and checks every PS_EVERY_SEC
+PS_EVERY_SEC = max(10, int(os.environ.get("PS_EVERY_SEC", "20")))
+PS_LOOP_SEC = int(os.environ.get("PS_LOOP_SEC", "330"))
+# At most this many Web API fallbacks (after a Sony 403) per run, to cap the cost
+PS_WEBAPI_MAX = int(os.environ.get("PS_WEBAPI_MAX", "6"))
 # Optional slower interval for single stores, e.g. AMAZON_EVERY_MIN=3 checks Amazon
 # only at minutes divisible by 3 (Amazon is the costly Web API request).
 STORE_EVERY_MIN = {"Amazon.de": int(os.environ.get("AMAZON_EVERY_MIN") or 0)}
@@ -76,6 +83,11 @@ STORE_EVERY_MIN = {"Amazon.de": int(os.environ.get("AMAZON_EVERY_MIN") or 0)}
 
 def store_interval(name, group):
     return max(STORE_EVERY_MIN.get(name) or 0, EVERY_MIN[group])
+
+
+def checks_per_slot(group):
+    """PlayStation is checked several times per minute."""
+    return max(1, 60 // PS_EVERY_SEC) if group == "ps" else 1
 CHECK_FROM = int(os.environ.get("CHECK_FROM", "8"))   # first hour with checks
 CHECK_TO = int(os.environ.get("CHECK_TO", "22"))      # last hour with checks
 # Hourly reports are only sent between these hours (Vilnius time, inclusive)
@@ -244,7 +256,7 @@ def alert(store, price, link, last_restock=None, qty=None, repeat=None, confirme
         # Flapping: one message instead of five
         buy = f"<a href=\"{html.escape(link)}\">Buy now</a>"
         send_telegram(f"🔁 <b>{html.escape(store)}</b> shows stock again "
-                      f"(#{repeat} in {FLAP_MIN} min, often phantom stock). Price: {p}{q}\n{buy}")
+                      f"(#{repeat} in {FLAP_MIN} min). Price: {p}{q}\n{buy}")
         return
     buy = (f"<a href=\"{html.escape(link)}\">Buy now</a>"
            + "".join(f"  |  <a href=\"{html.escape(u)}\">🛒 Add to cart</a>"
@@ -686,7 +698,7 @@ def get_ps_page(s, url, done):
     """Sony's page directly; through the Oxylabs Web API if Sony blocks GitHub (403)."""
     r = fetch_until(s, url, done, max_bytes=1_800_000,
                     headers={"Referer": "https://www.playstation.com/de-de/"})
-    if r.status_code == 403:
+    if r.status_code == 403 and WEBAPI_USED[0] < PS_WEBAPI_MAX:
         alt = fetch_via_webapi(url)
         if alt:
             return alt, "via Web API after Sony 403"
@@ -1013,18 +1025,20 @@ def check_saturn(s):
 
 
 # (name, check function, link for the alert, group)
-# Group "free" runs every 2 minutes, group "proxy" every 5 minutes. Each check
-# tries without the proxy first and falls back to it when a shop blocks GitHub.
+#   ps    PlayStation, loop every PS_EVERY_SEC seconds (cron job every 5 min)
+#   free  Alternate, Müller, every minute
+#   mms   MediaMarkt, Saturn, every 2 minutes (proxy + cart + address check)
+#   proxy Amazon, expert, every 5 minutes
 STORES = [
-    ("Amazon.de", check_amazon, AMAZON_URL, "proxy"),
-    ("PlayStation Store DE", check_psdirect, PSDIRECT_PAGE, "free"),
-    ("MediaMarkt.de", check_mediamarkt, MEDIAMARKT_URL, "free"),   # every 2 min (uses the proxy)
-    ("Saturn.de", check_saturn, SATURN_URL, "free"),               # every 2 min (uses the proxy)
+    ("PlayStation Store DE", check_psdirect, PSDIRECT_PAGE, "ps"),
+    ("MediaMarkt.de", check_mediamarkt, MEDIAMARKT_URL, "mms"),
+    ("Saturn.de", check_saturn, SATURN_URL, "mms"),
     ("Alternate.de", check_alternate, ALTERNATE_URL, "free"),
-    ("expert.de", check_expert, EXPERT_URL, "proxy"),
     ("Müller.de", check_mueller, MUELLER_URL, "free"),
+    ("Amazon.de", check_amazon, AMAZON_URL, "proxy"),
+    ("expert.de", check_expert, EXPERT_URL, "proxy"),
 ]
-GROUPS = ("free", "proxy")
+GROUPS = ("ps", "free", "mms", "proxy")
 
 
 # ------------------------------------------------------------------- main ---
@@ -1161,25 +1175,10 @@ def check_store(fn):
 
 
 def handle_result(name, link, status, price, note, st, ts):
-    if status == "UNSURE":
-        # Page shows stock, the cart neither confirms nor refuses: one normal message,
-        # not the 5x alarm, at most once per flap window
-        last = st.get("last_unsure_note")
-        if not last or minutes_between(last, ts) >= FLAP_MIN:
-            send_telegram(f"🟡 <b>{html.escape(name)}</b>: page shows stock, but the cart can't confirm "
-                          f"a delivery date. Probably phantom stock; check yourself if you like: "
-                          f"<a href=\"{html.escape(link)}\">open page</a>")
-            st["last_unsure_note"] = ts
-            log_history(ts, name, "UNSURE", price)
-        status = "OUT"
-    if status == "PHANTOM":
-        # Page shows stock, but the cart can't ship it: not buyable, so no alarm
-        last = st.get("last_phantom_note")
-        if not last or minutes_between(last, ts) >= FLAP_MIN:
-            send_telegram(f"👻 <b>{html.escape(name)}</b>: page shows stock, but the cart says "
-                          f"it can't be delivered. Not buyable right now.", silent=True)
-            st["last_phantom_note"] = ts
-            log_history(ts, name, "PHANTOM", price)  # once per window, not every check
+    if status in ("UNSURE", "PHANTOM"):
+        # Page shows stock but the cart can't confirm a real warehouse: not buyable.
+        # No message, only the log.
+        print(f"[{name}] page shows stock, cart not confirmed ({status}): treated as out of stock")
         status = "OUT"
     sig = re.search(r"override=([^,;)]+), highDemand=([a-z]+)", note or "")
     if sig:
@@ -1301,7 +1300,7 @@ def build_report(title, data, start, end, restock_day=None):
     for name, _, _, g in STORES:
         done, ok, k, a = data.get(name, (0, 0, 0, 0))
         line, ok, exp = report_line(name, done, ok,
-                                    expected_checks(store_interval(name, g), start, end))
+                                    expected_checks(store_interval(name, g), start, end) * checks_per_slot(g))
         lines.append(line)
         tot_ok += ok
         tot_exp += exp
@@ -1391,6 +1390,87 @@ def maybe_send_hourly(states, now):
         print("Hourly report sent.")
 
 
+def run_store(name, fn, link, g, states, now):
+    """One check of one store, including alerts and statistics. Returns the status."""
+    ts = now.strftime("%Y-%m-%d %H:%M")
+    day = ts[:10]
+    before = PROXY_BYTES[0]
+    api_n, done_by_api = 0, False
+    webapi_before = WEBAPI_USED[0]
+    if fn is check_amazon:
+        apis = []
+        if OXY_API_USER and OXY_API_PASS:
+            apis.append(("Scraper API", check_amazon_api))
+        if OXY_WEB_API_KEY:
+            apis.append(("Web API", check_amazon_webapi))
+        for label, api_fn in apis:
+            try:
+                status, price, note, billed = api_fn()
+            except Exception as e:
+                status, price, note, billed = "ERROR", None, f"{label}: {str(e)[:120]}", 0
+            api_n += billed
+            if status in ("IN_STOCK", "OUT"):
+                note, n_direct, n_proxy, done_by_api = f"{note} (via {label})", 0, 0, True
+                break
+            print(f"[{name}] {note} -> trying next method")
+    if not done_by_api:
+        status, price, note, n_direct, n_proxy = check_store(fn)
+    api_n += WEBAPI_USED[0] - webapi_before
+    print(f"{now.strftime('%H:%M:%S')} [{name}] {status} price={price} ({note})")
+    ok = handle_result(name, link, status, price, note, states[g].setdefault(name, {}), ts)
+
+    # compressed transfer is roughly 1/4 of the page size, plus ~5 KB
+    # connection overhead per proxy request
+    kb = (PROXY_BYTES[0] - before) / 4 / 1024 + 5 * n_proxy
+
+    stats = day_stats(states[g], day).setdefault(name, {"runs": 0, "ok": 0, "proxy_kb": 0})
+    stats["runs"] += 1
+    stats["ok"] += int(ok)
+    stats["proxy_kb"] = round(stats["proxy_kb"] + kb, 1)
+    stats["requests"] = stats.get("requests", 0) + n_direct + n_proxy
+    stats["proxy_requests"] = stats.get("proxy_requests", 0) + n_proxy
+    stats["api"] = stats.get("api", 0) + api_n
+
+    h = states[g].setdefault("_hourly", {}).setdefault(ts[:13], {}).setdefault(
+        name, {"checks": 0, "ok": 0, "req_direct": 0, "req_proxy": 0, "proxy_kb": 0})
+    h["checks"] += 1
+    h["ok"] += int(ok)
+    h["req_direct"] += n_direct
+    h["req_proxy"] += n_proxy
+    h["proxy_kb"] = round(h["proxy_kb"] + kb, 1)
+    h["api"] = h.get("api", 0) + api_n
+    return states[g][name].get("status")
+
+
+def flush_after_save(states, groups):
+    """Save state now and send the queued status messages (used inside the loop)."""
+    if save_states(states, groups) and AFTER_SAVE:
+        for text, silent in AFTER_SAVE:
+            send_telegram(text, silent=silent)
+        AFTER_SAVE.clear()
+
+
+def ps_loop(states, loaded):
+    """PlayStation every PS_EVERY_SEC seconds for PS_LOOP_SEC. Drops last ~1 minute,
+    so a fresh run per minute (plus GitHub's start delay) is too slow."""
+    name, fn, link, g = next(x for x in STORES if x[3] == "ps")
+    end = time.monotonic() + PS_LOOP_SEC
+    n = 0
+    while True:
+        t0 = time.monotonic()
+        prev = states[g].get(name, {}).get("status")
+        status = run_store(name, fn, link, g, states, datetime.now(TZ))
+        n += 1
+        if loaded[g] and (AFTER_SAVE or status != prev):
+            flush_after_save(states, [g])  # changes are saved and announced right away
+        wait = PS_EVERY_SEC - (time.monotonic() - t0)
+        if time.monotonic() + max(wait, 0) >= end:
+            break
+        if wait > 0:
+            time.sleep(wait)
+    print(f"[{name}] {n} checks in this run")
+
+
 def main():
     if os.environ.get("TEST_ALERT") == "true":
         send_telegram("✅ PS5 checker test: Telegram works. Example alert follows:")
@@ -1417,70 +1497,30 @@ def main():
         print(text or "no data")
         return
 
-    group = STORE_GROUP if STORE_GROUP in ("free", "proxy", "all") else "all"
+    group = STORE_GROUP if STORE_GROUP in GROUPS + ("all",) else "all"
     run_groups = GROUPS if group == "all" else (group,)
     states, loaded = load_all_states()
     # A store that moved to another group keeps its saved status and history
     for name, _, _, g in STORES:
-        other = "proxy" if g == "free" else "free"
-        if name not in states[g] and name in states[other]:
-            states[g][name] = dict(states[other][name])
+        if name not in states[g]:
+            for other in GROUPS:
+                if other != g and name in states[other]:
+                    states[g][name] = dict(states[other][name])
+                    break
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
-    day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 52) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 53) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
-        if g not in run_groups:
-            continue
+        if g not in run_groups or g == "ps" and group == "ps":
+            continue  # the PlayStation loop runs below
         every = store_interval(name, g)
         if every > EVERY_MIN[g] and now.minute % every != 0:
             continue  # this store has a slower interval and isn't due this minute
-        before = PROXY_BYTES[0]
-        api_n, done_by_api = 0, False
-        webapi_before = WEBAPI_USED[0]
-        if fn is check_amazon:
-            apis = []
-            if OXY_API_USER and OXY_API_PASS:
-                apis.append(("Scraper API", check_amazon_api))
-            if OXY_WEB_API_KEY:
-                apis.append(("Web API", check_amazon_webapi))
-            for label, api_fn in apis:
-                try:
-                    status, price, note, billed = api_fn()
-                except Exception as e:
-                    status, price, note, billed = "ERROR", None, f"{label}: {str(e)[:120]}", 0
-                api_n += billed
-                if status in ("IN_STOCK", "OUT"):
-                    note, n_direct, n_proxy, done_by_api = f"{note} (via {label})", 0, 0, True
-                    break
-                print(f"[{name}] {note} -> trying next method")
-        if not done_by_api:
-            status, price, note, n_direct, n_proxy = check_store(fn)
-        api_n += WEBAPI_USED[0] - webapi_before
-        print(f"[{name}] {status} price={price} ({note})")
-        ok = handle_result(name, link, status, price, note, states[g].setdefault(name, {}), ts)
+        run_store(name, fn, link, g, states, now)
 
-        # compressed transfer is roughly 1/4 of the page size, plus ~5 KB
-        # connection overhead per proxy request
-        kb = (PROXY_BYTES[0] - before) / 4 / 1024 + 5 * n_proxy
-
-        stats = day_stats(states[g], day).setdefault(name, {"runs": 0, "ok": 0, "proxy_kb": 0})
-        stats["runs"] += 1
-        stats["ok"] += int(ok)
-        stats["proxy_kb"] = round(stats["proxy_kb"] + kb, 1)
-        stats["requests"] = stats.get("requests", 0) + n_direct + n_proxy
-        stats["proxy_requests"] = stats.get("proxy_requests", 0) + n_proxy
-        stats["api"] = stats.get("api", 0) + api_n
-
-        h = states[g].setdefault("_hourly", {}).setdefault(ts[:13], {}).setdefault(
-            name, {"checks": 0, "ok": 0, "req_direct": 0, "req_proxy": 0, "proxy_kb": 0})
-        h["checks"] += 1
-        h["ok"] += int(ok)
-        h["req_direct"] += n_direct
-        h["req_proxy"] += n_proxy
-        h["proxy_kb"] = round(h["proxy_kb"] + kb, 1)
-        h["api"] = h.get("api", 0) + api_n
+    if group == "ps":
+        ps_loop(states, loaded)
 
     if "proxy" in run_groups and loaded["proxy"]:
         maybe_send_summary(states, now)

@@ -597,6 +597,48 @@ def parse_ps_shop_data(t):
     return None
 
 
+def list_ps_skus(t):
+    """All SKUs in Sony's embedded shop data: [(sku, name, status, override, high_demand, price)]."""
+    u = ps_unescape(t)
+    out, seen = [], set()
+    for m in re.finditer(r'"skus":\[\{"id":"([^"]+)"', u):
+        sku = m.group(1)
+        seg = u[m.start():m.start() + 3000]
+        st = re.search(r'"stockLevelStatus":"([A-Z_]+)"', seg)
+        if not st or sku in seen:
+            continue
+        seen.add(sku)
+        name = re.findall(r'"name":"([^"]{4,80})"', u[max(0, m.start() - 6000):m.start()])
+        pa = re.search(r'"physicalAttributes":\{([^}]*)\}', seg)
+        attrs = pa.group(1) if pa else ""
+        ov = re.search(r'"inventoryOverride":"?([^",}]*)', attrs)
+        hd = re.search(r'"highDemand":(true|false)', attrs)
+        pr = re.search(r'"price":(\d+)', seg)
+        out.append((sku, (name[0] if name else "?").replace("\\t", "").strip(), st.group(1),
+                    (ov.group(1) if ov else "") or "none", hd.group(1) if hd else "unknown",
+                    int(pr.group(1)) / 100 if pr else None))
+    return out
+
+
+def ps_test(url):
+    """Manual test: read Sony's shop data from any product page and report it."""
+    s = make_session(False)
+    r = fetch_until(s, url, lambda t: False, max_bytes=2_500_000,
+                    headers={"Referer": "https://www.playstation.com/de-de/"})
+    lines = [f"🧪 <b>PlayStation test</b>: HTTP {r.status_code}, {len(r.text) // 1024} KB",
+             html.escape(url)]
+    skus = list_ps_skus(r.text) if r.status_code == 200 else []
+    if not skus:
+        lines.append("No shop data (stockLevelStatus) found on this page.")
+    for sku, name, st, ov, hd, price in skus[:10]:
+        verdict = "IN STOCK" if st not in PS_OUT_STATUSES and ov.lower() != "forceoutofstock" else "out of stock"
+        lines.append(f"• <b>{html.escape(name[:50])}</b>\n  status={st}, override={ov}, highDemand={hd}, "
+                     f"price={price} → script would say: <b>{verdict}</b>")
+    text = "\n".join(lines)
+    print(re.sub(r"<[^>]+>", "", text))
+    send_telegram(text)
+
+
 def check_psdirect(s):
     if not PSDIRECT_URL.startswith("https://"):
         return "ERROR", None, f"bad PSDIRECT_URL: {PSDIRECT_URL!r}"
@@ -1211,6 +1253,11 @@ def main():
         sold_out_alert("Amazon.de (TEST)", 12)
         print("Test messages sent.")
 
+    ps_test_url = (os.environ.get("PS_TEST_URL") or "").strip()
+    if ps_test_url:
+        ps_test(ps_test_url)
+        return
+
     report = (os.environ.get("REPORT") or "none").strip().lower()
     if report != "none":
         states, _ = load_all_states()
@@ -1231,7 +1278,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 44) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 45) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

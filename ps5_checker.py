@@ -551,32 +551,77 @@ def parse_jsonld(text):
     return None
 
 
+# Sony's shop data is embedded far down in the product page (~860 KB in): per SKU
+# "stockLevelStatus", plus "inventoryOverride" (Sony's manual lock) and
+# "highDemand" (drop/queue mode). The simple product data near the top of the
+# page only serves as a fallback.
+PS_SKU_MARK = "PS5PRO"
+PS_OUT_STATUSES = {"OUT_OF_STOCK", "NO_STOCK", "SOLD_OUT", "NOT_AVAILABLE", "UNAVAILABLE", "DISCONTINUED"}
+
+
+def ps_unescape(t):
+    # the data sits inside a JavaScript string, so its quotes are escaped once or twice
+    return t.replace('\\\\', '\\').replace('\\"', '"')
+
+
+def ps_data_done(t):
+    """Stop downloading once the PS5 Pro's shop data (or a waiting queue) has arrived."""
+    if "queue-it" in t[:20000].lower():
+        return True
+    i = t.find(PS_SKU_MARK, 200_000)
+    while i >= 0:
+        j = t.find("inventoryOverride", i)
+        if 0 <= j - i < 3000 and len(t) > j + 300:
+            return True
+        i = t.find(PS_SKU_MARK, i + 1)
+    return False
+
+
+def parse_ps_shop_data(t):
+    """Returns dict(status, override, high_demand, price) for the PS5 Pro SKU, or None."""
+    u = ps_unescape(t)
+    for m in re.finditer(r'"skus":\[\{"id":"([^"]*' + PS_SKU_MARK + r'[^"]*)"', u):
+        seg = u[m.start():m.start() + 3000]
+        st = re.search(r'"stockLevelStatus":"([A-Z_]+)"', seg)
+        if not st:
+            continue
+        pa = re.search(r'"physicalAttributes":\{([^}]*)\}', seg)
+        attrs = pa.group(1) if pa else ""
+        ov = re.search(r'"inventoryOverride":"?([^",}]*)', attrs)
+        hd = re.search(r'"highDemand":(true|false)', attrs)
+        pr = re.search(r'"price":(\d+)', seg)
+        return {"status": st.group(1),
+                "override": (ov.group(1) if ov else "") or "none",
+                "high_demand": (hd.group(1) if hd else "unknown"),
+                "price": int(pr.group(1)) / 100 if pr else None}
+    return None
+
+
 def check_psdirect(s):
     if not PSDIRECT_URL.startswith("https://"):
         return "ERROR", None, f"bad PSDIRECT_URL: {PSDIRECT_URL!r}"
-    # The product data ends ~34 KB into a ~950 KB page: stop there (faster, fewer timeouts)
-    r = fetch_until(s, PSDIRECT_URL, jsonld_offer_done, max_bytes=1_500_000,
+    r = fetch_until(s, PSDIRECT_URL, ps_data_done, max_bytes=1_800_000,
                     headers={"Referer": "https://www.playstation.com/de-de/"})
     info = page_info("playstation", r)
     if r.status_code != 200:
         return "BLOCKED", None, f"HTTP {r.status_code} (final URL: {r.url})"
 
-    # Case 1: JSON stock request copied from DevTools
-    if "json" in r.headers.get("content-type", ""):
-        data = json.loads(r.text)
-        products = data.get("products") or [data]
-        p = products[0] if products else {}
-        stock = ((p.get("stock") or {}).get("stockLevelStatus")
-                 or p.get("stockStatus") or p.get("availability") or "")
-        price = parse_eur((p.get("price") or {}).get("value")
-                          if isinstance(p.get("price"), dict) else p.get("price"))
-        in_stock = str(stock).lower().replace("_", "") in ("instock", "available")
-        return ("IN_STOCK" if in_stock else "OUT"), price, f"stock={stock}"
+    # A drop often sends visitors to a waiting queue instead of the product page
+    if "queue-it" in str(r.url).lower() or "queue-it" in r.text[:20000].lower():
+        return "IN_STOCK", None, f"Sony waiting queue is active (drop in progress?); {info}"
 
-    # Case 2: product page
+    d = parse_ps_shop_data(r.text)
+    if d:
+        sig = f"override={d['override']}, highDemand={d['high_demand']}"
+        locked = d["override"].lower() == "forceoutofstock"
+        if d["status"] not in PS_OUT_STATUSES and not locked:
+            return "IN_STOCK", d["price"], f"shop data: {d['status']}; {sig}"
+        return "OUT", d["price"], f"shop data: {d['status']}; {sig}"
+
+    # Fallback: the simple product data near the top of the page
     res = parse_jsonld(r.text)
     if res:
-        return res
+        return res[0], res[1], f"{res[2]}; shop data not found (fallback); {info}"
     return "ERROR", None, f"no stock data on page; {info}"
 
 
@@ -792,12 +837,13 @@ def check_saturn(s):
 
 
 # (name, check function, link for the alert, group)
-# "free" stores work without the proxy and can be checked more often.
+# Group "free" runs every 2 minutes, group "proxy" every 5 minutes. Each check
+# tries without the proxy first and falls back to it when a shop blocks GitHub.
 STORES = [
     ("Amazon.de", check_amazon, AMAZON_URL, "proxy"),
     ("PlayStation Store DE", check_psdirect, PSDIRECT_PAGE, "free"),
-    ("MediaMarkt.de", check_mediamarkt, MEDIAMARKT_URL, "proxy"),
-    ("Saturn.de", check_saturn, SATURN_URL, "proxy"),
+    ("MediaMarkt.de", check_mediamarkt, MEDIAMARKT_URL, "free"),   # every 2 min (uses the proxy)
+    ("Saturn.de", check_saturn, SATURN_URL, "free"),               # every 2 min (uses the proxy)
     ("Alternate.de", check_alternate, ALTERNATE_URL, "free"),
     ("expert.de", check_expert, EXPERT_URL, "proxy"),
     ("Müller.de", check_mueller, MUELLER_URL, "free"),
@@ -948,6 +994,16 @@ def handle_result(name, link, status, price, note, st, ts):
             st["last_phantom_note"] = ts
             log_history(ts, name, "PHANTOM", price)  # once per window, not every check
         status = "OUT"
+    sig = re.search(r"override=([^,;)]+), highDemand=([a-z]+)", note or "")
+    if sig:
+        now_sig = f"override={sig.group(1)}, highDemand={sig.group(2)}"
+        before = st.get("ps_signals")
+        if before and before != now_sig:
+            send_after_save(f"👀 <b>{html.escape(name)}</b>: Sony changed its shop settings for the "
+                            f"PS5 Pro\n<b>Before:</b> {html.escape(before)}\n<b>Now:</b> {html.escape(now_sig)}\n"
+                            f"This often happens shortly before a drop. "
+                            f"<a href=\"{html.escape(link)}\">Open page</a>")
+        st["ps_signals"] = now_sig
     if status == "IN_STOCK" and price and price > MAX_PRICE:
         print(f"[{name}] price {price} above MAX_PRICE, no alert")
         status = "OUT"
@@ -1167,10 +1223,15 @@ def main():
     group = STORE_GROUP if STORE_GROUP in ("free", "proxy", "all") else "all"
     run_groups = GROUPS if group == "all" else (group,)
     states, loaded = load_all_states()
+    # A store that moved to another group keeps its saved status and history
+    for name, _, _, g in STORES:
+        other = "proxy" if g == "free" else "free"
+        if name not in states[g] and name in states[other]:
+            states[g][name] = dict(states[other][name])
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 42) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 44) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

@@ -597,6 +597,11 @@ def parse_ps_shop_data(t):
     return None
 
 
+def ps_in_stock(status, override):
+    """The one rule both the real check and the test use."""
+    return status not in PS_OUT_STATUSES and str(override).lower() != "forceoutofstock"
+
+
 def list_ps_skus(t):
     """All SKUs in Sony's embedded shop data: [(sku, name, status, override, high_demand, price)]."""
     u = ps_unescape(t)
@@ -625,15 +630,18 @@ def ps_test(url):
     s = make_session(False)
     r = fetch_until(s, url, lambda t: False, max_bytes=2_500_000,
                     headers={"Referer": "https://www.playstation.com/de-de/"})
-    lines = [f"🧪 <b>PlayStation test</b>: HTTP {r.status_code}, {len(r.text) // 1024} KB",
-             html.escape(url)]
     skus = list_ps_skus(r.text) if r.status_code == 200 else []
-    if not skus:
-        lines.append("No shop data (stockLevelStatus) found on this page.")
+    lines = ["🧪 <b>PlayStation test</b>"]
+    if r.status_code != 200:
+        lines.append(f"⚠️ Page could not be loaded (HTTP {r.status_code})")
+    elif not skus:
+        lines.append("⚠️ No stock data found on this page")
     for sku, name, st, ov, hd, price in skus[:10]:
-        verdict = "IN STOCK" if st not in PS_OUT_STATUSES and ov.lower() != "forceoutofstock" else "out of stock"
-        lines.append(f"• <b>{html.escape(name[:50])}</b>\n  status={st}, override={ov}, highDemand={hd}, "
-                     f"price={price} → script would say: <b>{verdict}</b>")
+        verdict = "✅ <b>IN STOCK</b>" if ps_in_stock(st, ov) else "❌ <b>OUT OF STOCK</b>"
+        p = f" – €{price:.2f}" if price else ""
+        lines.append(f"{verdict}\n{html.escape(name[:60])}{p}\n"
+                     f"<i>status={st}, override={ov}, highDemand={hd}</i>")
+    lines.append(html.escape(url))
     text = "\n".join(lines)
     print(re.sub(r"<[^>]+>", "", text))
     send_telegram(text)
@@ -655,8 +663,7 @@ def check_psdirect(s):
     d = parse_ps_shop_data(r.text)
     if d:
         sig = f"override={d['override']}, highDemand={d['high_demand']}"
-        locked = d["override"].lower() == "forceoutofstock"
-        if d["status"] not in PS_OUT_STATUSES and not locked:
+        if ps_in_stock(d["status"], d["override"]):
             return "IN_STOCK", d["price"], f"shop data: {d['status']}; {sig}"
         return "OUT", d["price"], f"shop data: {d['status']}; {sig}"
 
@@ -1278,7 +1285,7 @@ def main():
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
-    print(f"--- PS5 Pro stock check (version 45) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 46) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups:

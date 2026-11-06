@@ -14,6 +14,10 @@ on:
         type: choice
         options: [none, this hour, last hour, today, yesterday]
         default: none
+      ps_test_url:
+        description: "Test only: a PlayStation product page to read (no checks run)"
+        type: string
+        default: ""
       test_alert:
         description: "Send a Telegram test message"
         type: boolean
@@ -64,6 +68,7 @@ jobs:
           TEST_ALERT: ${{ inputs.test_alert }}
           DEBUG: ${{ inputs.debug }}
           REPORT: ${{ inputs.report }}
+          PS_TEST_URL: ${{ inputs.ps_test_url }}
         run: python -u ps5_checker.py
 
       - name: Save restock history to repo

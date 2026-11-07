@@ -694,15 +694,37 @@ def fetch_via_webapi(url):
 WEBAPI_USED = [0]  # Web API requests made as a fallback in this run
 
 
+def cache_bust(url):
+    """Add a unique query parameter so the CDN can't answer from its cache."""
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}_cb={int(time.time() * 1000)}{random.randint(100, 999)}"
+
+
+def cache_info(r):
+    """Short description of the CDN cache headers, to see whether a page was fresh."""
+    h = {k.lower(): v for k, v in (getattr(r, "headers", None) or {}).items()}
+    parts = []
+    if h.get("age"):
+        parts.append(f"age={h['age']}s")
+    for k in ("x-cache", "x-akamai-cache-status", "cf-cache-status", "x-cache-status"):
+        if h.get(k):
+            parts.append(f"{k}={h[k][:40]}")
+    if h.get("cache-control"):
+        parts.append(f"cc={h['cache-control'][:40]}")
+    return ", ".join(parts) or "no cache headers"
+
+
 def get_ps_page(s, url, done):
-    """Sony's page directly; through the Oxylabs Web API if Sony blocks GitHub (403)."""
-    r = fetch_until(s, url, done, max_bytes=1_800_000,
-                    headers={"Referer": "https://www.playstation.com/de-de/"})
+    """Sony's page directly, bypassing the CDN cache; through the Oxylabs Web API
+    if Sony blocks GitHub (403)."""
+    r = fetch_until(s, cache_bust(url), done, max_bytes=1_800_000,
+                    headers={"Referer": "https://www.playstation.com/de-de/",
+                             "Cache-Control": "no-cache", "Pragma": "no-cache"})
     if r.status_code == 403 and WEBAPI_USED[0] < PS_WEBAPI_MAX:
-        alt = fetch_via_webapi(url)
+        alt = fetch_via_webapi(cache_bust(url))
         if alt:
             return alt, "via Web API after Sony 403"
-    return r, ""
+    return r, cache_info(r)
 
 
 def check_psdirect(s):
@@ -893,6 +915,7 @@ def mms_test(product_id):
     """Manual test: run the full cart chain (add -> address -> warehouse) for any product."""
     global MMS_PRODUCT_ID
     real_id, MMS_PRODUCT_ID = MMS_PRODUCT_ID, product_id
+    mode = True
     lines = [f"🧪 <b>Cart test</b> with product {html.escape(product_id)}",
              "Address: " + ("set ✅" if mms_address() else "⚠️ MMS_ADDRESS missing or wrong format")]
     icons = {"YES": "✅ <b>CONFIRMED</b>", "NO": "❌ <b>NOT AVAILABLE</b>",
@@ -900,12 +923,20 @@ def mms_test(product_id):
     try:
         for label in ("mediamarkt", "saturn"):
             base = MMS_SHOPS[label][0]
+            page_fn = check_mediamarkt if label == "mediamarkt" else check_saturn
             try:
-                verdict, detail = mms_cart_check(make_session(True), label,
+                pst, _, pnote = page_fn(make_session(mode))
+                page = ("✅ loads" if pst in ("OUT", "IN_STOCK", "PHANTOM", "UNSURE")
+                        else f"❌ {pst}") + f" ({pnote[:80]})"
+            except Exception as e:
+                page = f"❌ {type(e).__name__}: {str(e)[:100]}"
+            try:
+                verdict, detail = mms_cart_check(make_session(mode), label,
                                                  f"{base}/de/product/_test-{product_id}.html")
             except Exception as e:
                 verdict, detail = "UNKNOWN", f"{type(e).__name__}: {e}"[:200]
-            lines.append(f"{label.capitalize()}: {icons.get(verdict, verdict)}\n<i>{html.escape(detail)}</i>")
+            lines.append(f"{label.capitalize()}: {icons.get(verdict, verdict)}\n"
+                         f"<i>PS5 Pro page: {html.escape(page)}\ncart: {html.escape(detail)}</i>")
     finally:
         MMS_PRODUCT_ID = real_id
     text = "\n".join(lines)
@@ -1142,15 +1173,15 @@ def day_stats(state, day):
     return state.setdefault("_stats", {}).setdefault(day, {})
 
 
-def check_store(fn):
+def check_store(fn, modes=(False, True, True)):
     """Direct first (free); Oxylabs only if the shop blocks GitHub's IP.
 
     Returns status, price, note and how many requests went direct / via proxy.
     """
     status, price, note, used = "ERROR", None, "", "direct"
     n_direct = n_proxy = 0
-    for use_proxy in (False, True, True):
-        if use_proxy:
+    for use_proxy in modes:
+        if use_proxy is True:
             n_proxy += 1
         else:
             n_direct += 1
@@ -1158,7 +1189,7 @@ def check_store(fn):
             status, price, note = fn(make_session(use_proxy))
         except Exception as e:
             status, price, note = "ERROR", None, str(e)[:160]
-            if use_proxy and "CONNECT tunnel failed" in str(e):
+            if use_proxy is True and "CONNECT tunnel failed" in str(e):
                 # Oxylabs refuses this site (PlayStation): give direct one more try
                 time.sleep(3)
                 n_direct += 1
@@ -1509,7 +1540,7 @@ def main():
                     break
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
-    print(f"--- PS5 Pro stock check (version 53) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 56) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups or g == "ps" and group == "ps":

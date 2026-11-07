@@ -1,4 +1,4 @@
-"""PS5 Pro stock checker: Amazon.de, PlayStation Store DE, MediaMarkt.de, Saturn.de,
+"""PS5 Pro stock checker: PlayStation Store DE, MediaMarkt.de, Saturn.de,
 Alternate.de, expert.de
 Requires: pip install curl_cffi
 Env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, OXYLABS_USER, OXYLABS_PASS
@@ -28,26 +28,6 @@ OXY_PASS = os.environ["OXYLABS_PASS"].strip().strip("\"'")
 
 MAX_PRICE = float(os.environ.get("MAX_PRICE", "900"))  # MSRP 899.99
 
-AMAZON_URL = "https://www.amazon.de/dp/B0FRYBZR91"
-# Amazon's standard add-to-cart link: opens a page where you confirm adding it
-AMAZON_CART_URL = "https://www.amazon.de/gp/aws/cart/add.html?ASIN.1=B0FRYBZR91&Quantity.1=1"
-CART_LINKS = {"Amazon.de": AMAZON_CART_URL}
-AMAZON_ASIN = "B0FRYBZR91"
-
-# Oxylabs Web Scraper API for Amazon ($0.50 per 1,000 successful results).
-# Used first for Amazon when configured; the proxy method stays as fallback.
-OXY_API_USER = (os.environ.get("OXY_API_USER") or "").strip()
-OXY_API_PASS = (os.environ.get("OXY_API_PASS") or "").strip()
-OXY_API_URL = "https://realtime.oxylabs.io/v1/queries"
-OXY_API_PRICE_PER_1K = 0.50
-AMAZON_POSTCODE = "10115"  # German "deliver to" address for the API (Berlin)
-
-# Oxylabs Web API (/v1/scrape, API key): fetches the Amazon page from Germany and
-# returns its HTML, which is then read by the normal Amazon page check.
-OXY_WEB_API_KEY = (os.environ.get("OXY_WEB_API_KEY") or "").strip()
-OXY_WEB_API_URL = "https://webapi.oxylabs.io/v1/scrape"
-# Dedicated Amazon scraper: accepts a German postcode as location
-OXY_WEB_API_AMAZON_URL = "https://webapi.oxylabs.io/v1/scrape/amazon/product"
 MEDIAMARKT_URL = "https://www.mediamarkt.de/de/product/_sony-playstationr5-pro-2-tb-konsole-3018022.html"
 # Saturn belongs to MediaMarkt and uses the same product number and page layout:
 SATURN_URL = "https://www.saturn.de/de/product/_sony-playstationr5-pro-2-tb-konsole-3018022.html"
@@ -74,9 +54,8 @@ EVERY_MIN = {"ps": 1,  # PlayStation runs as a loop, see PS_EVERY_SEC
 # PlayStation: one run stays alive for PS_LOOP_SEC and checks every PS_EVERY_SEC
 PS_EVERY_SEC = max(10, int(os.environ.get("PS_EVERY_SEC", "20")))
 PS_LOOP_SEC = int(os.environ.get("PS_LOOP_SEC", "330"))
-# Optional slower interval for single stores, e.g. AMAZON_EVERY_MIN=3 checks Amazon
-# only at minutes divisible by 3 (Amazon is the costly Web API request).
-STORE_EVERY_MIN = {"Amazon.de": int(os.environ.get("AMAZON_EVERY_MIN") or 0)}
+# Optional slower interval for single stores: {"store name": minutes}
+STORE_EVERY_MIN = {}
 
 
 def store_interval(name, group):
@@ -204,11 +183,6 @@ def fetch_until(s, url, done, max_bytes, headers=None):
     return Partial(r.status_code, buf.decode("utf-8", "ignore"), r.headers, r.url)
 
 
-def amazon_done(t):
-    # Product bullets come right after the buy box / seller / price area.
-    return 'id="feature-bullets"' in t or 'id="featurebullets"' in t
-
-
 def mediamarkt_done(t):
     i = t.find("ld+json")
     return i >= 0 and t.find("</script>", i) > 0
@@ -256,9 +230,7 @@ def alert(store, price, link, last_restock=None, qty=None, repeat=None, confirme
         send_telegram(f"🔁 <b>{html.escape(store)}</b> shows stock again "
                       f"(#{repeat} in {FLAP_MIN} min). Price: {p}{q}\n{buy}")
         return
-    buy = (f"<a href=\"{html.escape(link)}\">Buy now</a>"
-           + "".join(f"  |  <a href=\"{html.escape(u)}\">🛒 Add to cart</a>"
-                     for k, u in CART_LINKS.items() if store.startswith(k)))
+    buy = f"<a href=\"{html.escape(link)}\">Buy now</a>"
     send_telegram(
         f"🚨 <b>PS5 Pro IN STOCK!</b> 🚨\n"
         f"<b>Store:</b> {html.escape(store)}\n"
@@ -306,219 +278,6 @@ def log_history(ts, store, event, price, minutes=""):
 
 # ----------------------------------------------------------------- checks ---
 # Each returns (status, price, note); status: IN_STOCK | OUT | BLOCKED | ERROR
-
-def interpret_amazon_json(c):
-    """Oxylabs parsed Amazon product fields -> status, price, note."""
-    title = str(c.get("title") or c.get("product_name") or "")
-    if not EXPECTED_NAME.search(title.replace("®", "")):
-        return "ERROR", None, f"wrong product '{title[:40]}'"
-
-    stock = str(c.get("stock") or "")
-    pb = c.get("price_buybox")
-    price = parse_eur(pb) if isinstance(pb, (int, float, str)) and parse_eur(pb) and parse_eur(pb) > 0 else None
-    if price is None:
-        p2 = parse_eur(c.get("price"))
-        price = p2 if p2 and p2 > 0 else None
-
-    # Who sells it in the buy box?
-    sellers = []
-    fm = c.get("featured_merchant") or {}
-    if isinstance(fm, dict):
-        sellers.append(str(fm.get("name") or ""))
-    for b in c.get("buybox") or []:
-        if isinstance(b, dict):
-            sellers.append(str(b.get("seller") or b.get("name") or b.get("sold_by") or ""))
-    seller_text = " / ".join(x for x in sellers if x) or "unknown"
-    sold_by_amazon = any("amazon" in x.lower() for x in sellers)
-
-    unavailable = re.search(r"(?i)nicht verfügbar|unavailable|nicht auf lager|out of stock|"
-                            r"derzeit nicht|ausverkauft", stock)
-    has_buybox = price is not None and not unavailable
-    if unavailable:
-        stock_en = "currently unavailable"
-    elif re.search(r"(?i)auf lager|in stock|nur noch", stock):
-        stock_en = "in stock"
-    else:
-        stock_en = stock[:40] or "no stock info"
-    if has_buybox and sold_by_amazon:
-        return "IN_STOCK", price, f"buy box sold by Amazon ({stock_en})"
-    if has_buybox:
-        return "OUT", price, f"buy box, but seller is {seller_text[:40]}"
-    return "OUT", price, f"no Amazon offer ({stock_en})"
-
-
-def check_amazon_api():
-    """Amazon via Oxylabs Web Scraper API. Returns status, price, note, billed(0/1)."""
-    payload = {
-        "source": "amazon_product",
-        "domain": "de",
-        "query": AMAZON_ASIN,
-        "geo_location": AMAZON_POSTCODE,
-        "parse": True,
-        # accurate buy box data for the exact variant (adds th=1&psc=1)
-        "context": [{"key": "autoselect_variant", "value": True}],
-    }
-    r = requests.post(OXY_API_URL, json=payload, auth=(OXY_API_USER, OXY_API_PASS),
-                      timeout=90)
-    if r.status_code == 401:
-        return "ERROR", None, "Scraper API: wrong OXY_API_USER / OXY_API_PASS", 0
-    if r.status_code != 200:
-        return "BLOCKED", None, f"Scraper API HTTP {r.status_code}: {r.text[:120]}", 0
-    try:
-        res = (r.json().get("results") or [{}])[0]
-    except ValueError:
-        return "ERROR", None, "Scraper API: response was not JSON", 0
-    c = res.get("content")
-    if res.get("status_code") not in (200, None) or not isinstance(c, dict):
-        return "BLOCKED", None, f"Scraper API: no product data (status {res.get('status_code')})", 0
-
-    status, price, note = interpret_amazon_json(c)
-    return status, price, note, 1
-
-
-def webapi_problem(r):
-    """Oxylabs error body -> 'HTTP 400 TITLE: detail [#/field: reason]'."""
-    try:
-        d = r.json()
-        fields = "; ".join(f"{e.get('pointer')}: {e.get('detail')}" for e in d.get("errors") or [])
-        return (f"HTTP {r.status_code} {d.get('title')}: {d.get('detail')}"
-                + (f" [{fields}]" if fields else ""))[:300]
-    except Exception:
-        return f"HTTP {r.status_code}: {r.text[:200]}"
-
-
-def check_amazon_webapi():
-    """Amazon via Oxylabs Web API. Returns status, price, note, billed(0/1)."""
-    key = OXY_WEB_API_KEY if OXY_WEB_API_KEY.lower().startswith("bearer ") else f"Bearer {OXY_WEB_API_KEY}"
-    headers = {"Content-Type": "application/json", "Authorization": key,
-               "User-Agent": "ps5-stock-checker"}
-    # Oxylabs rejects both "DE" and a German postcode as location for Amazon,
-    # so no location is sent; the page's delivery address is checked instead.
-    # 1st choice: dedicated Amazon scraper with a German postcode (Berlin).
-    # 2nd: generic page scrape without location (Oxylabs picks the exit IP).
-    attempts = [
-        (OXY_WEB_API_AMAZON_URL, {"query": AMAZON_ASIN, "domain": "de", "location": AMAZON_POSTCODE,
-                                  "currency": "EUR", "output": ["html", "json"]}),
-        (OXY_WEB_API_AMAZON_URL, {"query": AMAZON_ASIN, "domain": "de", "location": AMAZON_POSTCODE,
-                                  "currency": "EUR", "output": ["json"]}),
-        (OXY_WEB_API_URL, {"url": f"{AMAZON_URL}?th=1&psc=1", "output": ["html"], "run_js": False}),
-    ]
-    r = None
-    for url, payload in attempts:
-        r = requests.post(url, json=payload, timeout=150, headers=headers)
-        if r.status_code in (200, 201) or r.status_code == 401:
-            break
-        print(f"Web API ({url.rsplit('/v1/', 1)[-1]}) not usable: {webapi_problem(r)}")
-    if r.status_code == 401:
-        return "ERROR", None, "Web API: key rejected (check OXY_WEB_API_KEY)", 0
-    if r.status_code not in (200, 201):
-        return "BLOCKED", None, f"Web API {webapi_problem(r)}", 0
-    try:
-        data = r.json()
-    except ValueError:
-        return "ERROR", None, "Web API: response was not JSON", 0
-    res = (data.get("results") or [{}])[0] if isinstance(data, dict) else {}
-    endpoint = "amazon scraper" if "/amazon/" in r.url else "page scrape"
-    page = res.get("html") or res.get("content") or ""
-    if isinstance(page, list):
-        page = "".join(str(x) for x in page)
-    if page:
-        # Only accepted if the page shows a German delivery address
-        status, price, note = parse_amazon_page(
-            str(page), f"Web API {endpoint}, {len(page) // 1024} KB", trusted_location=False)
-        return status, price, note, 1
-    parsed = res.get("json")
-    if isinstance(parsed, dict) and parsed:
-        status, price, note = interpret_amazon_json(parsed)
-        return status, price, f"{note}; Web API {endpoint} (parsed data)", 1
-    return "ERROR", None, f"Web API: no html or json in response (keys: {list(res)[:8]})", 1
-
-
-def check_amazon(s):
-    r = fetch_until(s, AMAZON_URL, amazon_done, max_bytes=900_000)
-    info = page_info("amazon", r)
-    if r.status_code != 200:
-        return "BLOCKED", None, f"captcha/blocked; {info}"
-    return parse_amazon_page(r.text, info, trusted_location=getattr(s, "via_proxy", False))
-
-
-SELLER_LABEL = re.compile(
-    r"(?:Verkäufer|Verk&auml;ufer|Verkauf durch|Verkauft von|Versand und Verkauf durch|Sold by)"
-    r"[\s:]*(?:<[^>]+>[\s:]*){0,15}Amazon\b", re.I)  # only tags between label and "Amazon"
-
-
-def amazon_is_seller(t):
-    """True if the buy box says Amazon itself sells the item."""
-    i = t.find('id="merchantInfoFeature_feature_div"')
-    if i >= 0 and re.search(r">\s*Amazon", t[i:i + 2500]) and "sellerProfileTriggerId" not in t[i:i + 2500]:
-        return True
-    b = t.find('id="buybox"')
-    region = t[b:b + 120_000] if b >= 0 else ""
-    if not region:
-        return False
-    # A link to a seller profile in the buy box means a third-party seller
-    if 'id="sellerProfileTriggerId"' in region:
-        return False
-    return bool(SELLER_LABEL.search(region))
-
-
-def parse_amazon_page(t, info, trusted_location):
-    """Reads an Amazon.de product page (from the proxy or from the Oxylabs Web API)."""
-    if "captcha" in t.lower():
-        return "BLOCKED", None, f"captcha/blocked; {info}"
-
-    title = re.search(r"<title[^>]*>(.*?)</title>", t, re.S | re.I)
-    if not title or not EXPECTED_NAME.search(html.unescape(title.group(1))):
-        found = html.unescape(title.group(1)).strip()[:60] if title else "no title"
-        return "ERROR", None, f"not the PS5 Pro page (title: '{found}'); {info}"
-    if 'id="buybox"' not in t and 'id="desktop_buybox"' not in t:
-        return "ERROR", None, f"page layout changed (no buy box area); {info}"
-    if not amazon_done(t):
-        return "ERROR", None, f"page incomplete or layout changed; {info}"
-
-    # Where Amazon thinks we are: GitHub's servers are mostly in the US, and a
-    # non-German visitor may see "cannot be shipped" instead of the buy box.
-    loc = ""
-    i = t.find('id="glow-ingress-line1"')
-    if i >= 0:
-        raw = t[i:i + 1000].split(">", 1)[-1]
-        raw = re.sub(r"<[^>]*>", " ", raw)          # complete tags
-        raw = re.sub(r"<[^>]*$", " ", raw)          # a tag cut off at the end
-        raw = re.sub(r"[\u200b-\u200f\u2060\ufeff]", "", html.unescape(raw))  # invisible chars
-        loc = re.sub(r"\s+", " ", raw).split("Standort")[0].strip()
-    # German formats seen: "Lieferung an Berlin 10115", "Liefern nach 10115 Berlin".
-    # A foreign visitor gets a country name instead ("Lieferung nach Vereinigte Staaten").
-    german = bool(re.match(r"(?:Lieferung an|Liefern an|Liefern nach|Lieferung nach)\s.*\b\d{5}\b", loc)) \
-        or AMAZON_POSTCODE in loc
-    loc_en = re.sub(r"^(?:Lieferung|Liefern) (?:an|nach)\s*", "", loc)[:35] or "unknown"
-    if not german and not trusted_location:
-        return "BLOCKED", None, f"page not for Germany (delivery to: {loc_en})"
-
-    has_cart = 'id="add-to-cart-button"' in t or 'id="buy-now-button"' in t
-
-    sold_by_amazon = amazon_is_seller(t)
-
-    price = None
-    j = t.find('id="corePrice_feature_div"')
-    if j >= 0:
-        m = re.search(r'class="a-offscreen">([^<]+)<', t[j:j + 3000])
-        price = parse_eur(m.group(1)) if m else None
-
-    # Only look inside the PS5 Pro's own buy box area: further down, the page has
-    # recommended products with their own "Nur noch 19 auf Lager".
-    b = t.find('id="buybox"')
-    e = t.find('id="feature-bullets"', b) if b >= 0 else -1
-    region = t[b:e] if b >= 0 and e > b else (t[b:b + 150_000] if b >= 0 else "")
-    m = re.search(r"(?i)nur noch (\d+)\s*(?:Stück\s*)?(?:auf Lager|vorrätig)|only (\d+) left in stock", region)
-    qty = f"stock: {m.group(1) or m.group(2)}; " if m else ""
-    if has_cart and sold_by_amazon:
-        return "IN_STOCK", price, f"buy button, sold by Amazon; {qty}delivery to {loc_en}"
-    if has_cart:
-        why = "buy button, but seller is not Amazon"
-    else:
-        why = "no buy button"
-    return "OUT", price, f"{why}; {qty}delivery to {loc_en}; {info}"
-
 
 def parse_jsonld(text):
     """Read schema.org availability/price of the page's MAIN product.
@@ -1020,14 +779,13 @@ def check_saturn(s):
 #   ps    PlayStation, loop every PS_EVERY_SEC seconds (cron job every 5 min)
 #   free  Alternate, Müller, every minute
 #   mms   MediaMarkt, Saturn, every 2 minutes (proxy + cart + address check)
-#   proxy Amazon, expert, every 5 minutes
+#   proxy expert, every 5 minutes
 STORES = [
     ("PlayStation Store DE", check_psdirect, PSDIRECT_PAGE, "ps"),
     ("MediaMarkt.de", check_mediamarkt, MEDIAMARKT_URL, "mms"),
     ("Saturn.de", check_saturn, SATURN_URL, "mms"),
     ("Alternate.de", check_alternate, ALTERNATE_URL, "free"),
     ("Müller.de", check_mueller, MUELLER_URL, "free"),
-    ("Amazon.de", check_amazon, AMAZON_URL, "proxy"),
     ("expert.de", check_expert, EXPERT_URL, "proxy"),
 ]
 GROUPS = ("ps", "free", "mms", "proxy")
@@ -1243,7 +1001,7 @@ def restocks_on(day):
 
 
 def report_line(name, done, ok, expected):
-    """'✅ Amazon.de: 12/12 successful' plus failed/missing details."""
+    """'✅ expert.de: 12/12 successful' plus failed/missing details."""
     expected = max(expected, done)
     failed, missing = done - ok, expected - done
     icon = "✅" if ok == expected else ("⚠️" if ok else "❌")
@@ -1307,8 +1065,6 @@ def build_report(title, data, start, end, restock_day=None):
               ) if events else "none"
         text += f"\n<b>Restocks:</b> {ev}"
     text += f"\n<b>Proxy traffic:</b> ~{kb / 1024:.2f} MB (estimate)"
-    if api:
-        text += f"\n<b>Amazon via Oxylabs API:</b> {api} requests"
     return text
 
 
@@ -1387,25 +1143,8 @@ def run_store(name, fn, link, g, states, now):
     ts = now.strftime("%Y-%m-%d %H:%M")
     day = ts[:10]
     before = PROXY_BYTES[0]
-    api_n, done_by_api = 0, False
-    if fn is check_amazon:
-        apis = []
-        if OXY_API_USER and OXY_API_PASS:
-            apis.append(("Scraper API", check_amazon_api))
-        if OXY_WEB_API_KEY:
-            apis.append(("Web API", check_amazon_webapi))
-        for label, api_fn in apis:
-            try:
-                status, price, note, billed = api_fn()
-            except Exception as e:
-                status, price, note, billed = "ERROR", None, f"{label}: {str(e)[:120]}", 0
-            api_n += billed
-            if status in ("IN_STOCK", "OUT"):
-                note, n_direct, n_proxy, done_by_api = f"{note} (via {label})", 0, 0, True
-                break
-            print(f"[{name}] {note} -> trying next method")
-    if not done_by_api:
-        status, price, note, n_direct, n_proxy = check_store(fn)
+    api_n = 0
+    status, price, note, n_direct, n_proxy = check_store(fn)
     print(f"{now.strftime('%H:%M:%S')} [{name}] {status} price={price} ({note})")
     ok = handle_result(name, link, status, price, note, states[g].setdefault(name, {}), ts)
 
@@ -1464,8 +1203,8 @@ def ps_loop(states, loaded):
 def main():
     if os.environ.get("TEST_ALERT") == "true":
         send_telegram("✅ PS5 checker test: Telegram works. Example alert follows:")
-        alert("Amazon.de (TEST)", 899.99, AMAZON_URL, "2026-10-27 09:05")
-        sold_out_alert("Amazon.de (TEST)", 12)
+        alert("MediaMarkt.de (TEST)", 899.99, MEDIAMARKT_URL, "2026-10-27 09:05")
+        sold_out_alert("MediaMarkt.de (TEST)", 12)
         print("Test messages sent.")
 
     mms_test_product = (os.environ.get("MMS_TEST_PRODUCT") or "").strip()
@@ -1499,7 +1238,7 @@ def main():
                     break
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
-    print(f"--- PS5 Pro stock check (version 57) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 58) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups or g == "ps" and group == "ps":

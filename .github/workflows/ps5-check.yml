@@ -73,7 +73,6 @@ jobs:
           PROXY_EVERY_MIN: "5"    # Amazon, expert
           PS_EVERY_SEC: "20"      # PlayStation check interval inside one run
           PS_LOOP_SEC: "330"      # how long one PlayStation run keeps checking (cron: every 5 min)
-          PS_WEBAPI_MAX: "6"      # max Web API fallbacks per PlayStation run (after Sony 403s)
           AMAZON_EVERY_MIN: "5"   # Amazon interval (at least the proxy interval)
           STORE_GROUP: ${{ env.GROUP }}
           TEST_ALERT: ${{ inputs.test_alert }}

@@ -216,6 +216,8 @@ def stock_qty(note):
 
 
 def alert(store, price, link, last_restock=None, qty=None, repeat=None, confirmed=False):
+    if "playstation.com" in link:
+        link = cache_bust(link)  # fresh page instead of the CDN's stored copy
     p = f"€{price:.2f}" if price else "unknown"
     last = f"\n<b>Last restock here:</b> {last_restock}" if last_restock else ""
     q = f"\n<b>Stock:</b> {qty} unit{'s' if qty != 1 else ''}" if qty is not None else ""
@@ -1238,7 +1240,7 @@ def main():
                     break
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
-    print(f"--- PS5 Pro stock check (version 58) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 59) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups or g == "ps" and group == "ps":

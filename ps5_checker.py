@@ -74,8 +74,6 @@ EVERY_MIN = {"ps": 1,  # PlayStation runs as a loop, see PS_EVERY_SEC
 # PlayStation: one run stays alive for PS_LOOP_SEC and checks every PS_EVERY_SEC
 PS_EVERY_SEC = max(10, int(os.environ.get("PS_EVERY_SEC", "20")))
 PS_LOOP_SEC = int(os.environ.get("PS_LOOP_SEC", "330"))
-# At most this many Web API fallbacks (after a Sony 403) per run, to cap the cost
-PS_WEBAPI_MAX = int(os.environ.get("PS_WEBAPI_MAX", "6"))
 # Optional slower interval for single stores, e.g. AMAZON_EVERY_MIN=3 checks Amazon
 # only at minutes divisible by 3 (Amazon is the costly Web API request).
 STORE_EVERY_MIN = {"Amazon.de": int(os.environ.get("AMAZON_EVERY_MIN") or 0)}
@@ -662,38 +660,6 @@ def ps_test(url):
     send_telegram(text)
 
 
-class WebApiPage:
-    """Minimal response object for a page fetched through the Oxylabs Web API."""
-    def __init__(self, status_code, text, url):
-        self.status_code, self.text, self.url, self.headers = status_code, text, url, {}
-
-
-def fetch_via_webapi(url):
-    """Fetch a page's HTML through the Oxylabs Web API from Germany (fallback when blocked)."""
-    if not OXY_WEB_API_KEY:
-        return None
-    key = OXY_WEB_API_KEY if OXY_WEB_API_KEY.lower().startswith("bearer ") else f"Bearer {OXY_WEB_API_KEY}"
-    r = requests.post(OXY_WEB_API_URL, timeout=120,
-                      json={"url": url, "output": ["html"], "run_js": False, "location": "DE"},
-                      headers={"Content-Type": "application/json", "Authorization": key,
-                               "User-Agent": "ps5-stock-checker"})
-    if r.status_code not in (200, 201):
-        print(f"Web API fallback failed: {webapi_problem(r)}")
-        return None
-    try:
-        res = (r.json().get("results") or [{}])[0]
-    except ValueError:
-        return None
-    page = res.get("html") or ""
-    if isinstance(page, list):
-        page = "".join(str(x) for x in page)
-    WEBAPI_USED[0] += 1
-    return WebApiPage(200, str(page), url) if page else None
-
-
-WEBAPI_USED = [0]  # Web API requests made as a fallback in this run
-
-
 def cache_bust(url):
     """Add a unique query parameter so the CDN can't answer from its cache."""
     sep = "&" if "?" in url else "?"
@@ -715,15 +681,10 @@ def cache_info(r):
 
 
 def get_ps_page(s, url, done):
-    """Sony's page directly, bypassing the CDN cache; through the Oxylabs Web API
-    if Sony blocks GitHub (403)."""
+    """Sony's page directly, bypassing the CDN cache."""
     r = fetch_until(s, cache_bust(url), done, max_bytes=1_800_000,
                     headers={"Referer": "https://www.playstation.com/de-de/",
                              "Cache-Control": "no-cache", "Pragma": "no-cache"})
-    if r.status_code == 403 and WEBAPI_USED[0] < PS_WEBAPI_MAX:
-        alt = fetch_via_webapi(cache_bust(url))
-        if alt:
-            return alt, "via Web API after Sony 403"
     return r, cache_info(r)
 
 
@@ -1427,7 +1388,6 @@ def run_store(name, fn, link, g, states, now):
     day = ts[:10]
     before = PROXY_BYTES[0]
     api_n, done_by_api = 0, False
-    webapi_before = WEBAPI_USED[0]
     if fn is check_amazon:
         apis = []
         if OXY_API_USER and OXY_API_PASS:
@@ -1446,7 +1406,6 @@ def run_store(name, fn, link, g, states, now):
             print(f"[{name}] {note} -> trying next method")
     if not done_by_api:
         status, price, note, n_direct, n_proxy = check_store(fn)
-    api_n += WEBAPI_USED[0] - webapi_before
     print(f"{now.strftime('%H:%M:%S')} [{name}] {status} price={price} ({note})")
     ok = handle_result(name, link, status, price, note, states[g].setdefault(name, {}), ts)
 
@@ -1540,7 +1499,7 @@ def main():
                     break
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
-    print(f"--- PS5 Pro stock check (version 56) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 57) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups or g == "ps" and group == "ps":

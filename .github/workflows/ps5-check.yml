@@ -59,9 +59,6 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           OXYLABS_USER: ${{ secrets.OXYLABS_USER }}
           OXYLABS_PASS: ${{ secrets.OXYLABS_PASS }}
-          OXY_API_USER: ${{ secrets.OXY_API_USER }}
-          OXY_API_PASS: ${{ secrets.OXY_API_PASS }}
-          OXY_WEB_API_KEY: ${{ secrets.OXY_WEB_API_KEY }}
           MMS_ADDRESS: ${{ secrets.MMS_ADDRESS }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
@@ -70,10 +67,9 @@ jobs:
           # must match the cron jobs on cron-job.org
           FREE_EVERY_MIN: "1"     # Alternate, Müller
           MMS_EVERY_MIN: "2"      # MediaMarkt, Saturn
-          PROXY_EVERY_MIN: "5"    # Amazon, expert
+          PROXY_EVERY_MIN: "5"    # expert
           PS_EVERY_SEC: "20"      # PlayStation check interval inside one run
           PS_LOOP_SEC: "330"      # how long one PlayStation run keeps checking (cron: every 5 min)
-          AMAZON_EVERY_MIN: "5"   # Amazon interval (at least the proxy interval)
           STORE_GROUP: ${{ env.GROUP }}
           TEST_ALERT: ${{ inputs.test_alert }}
           DEBUG: ${{ inputs.debug }}

@@ -215,7 +215,7 @@ def stock_qty(note):
     return int(m.group(1)) if m else None
 
 
-def alert(store, price, link, last_restock=None, qty=None, repeat=None, confirmed=False):
+def alert(store, price, link, last_restock=None, qty=None, repeat=None, confirmed=False, why=None):
     if "playstation.com" in link:
         link = cache_bust(link)  # fresh page instead of the CDN's stored copy
     p = f"€{price:.2f}" if price else "unknown"
@@ -226,6 +226,8 @@ def alert(store, price, link, last_restock=None, qty=None, repeat=None, confirme
         m = re.search(r"cart: ([^✅]+)", confirmed if isinstance(confirmed, str) else "")
         detail = m.group(1).strip(" ;") if m else "delivery confirmed"
         q += f"\n✅ <b>MediaMarkt cart:</b> {html.escape(detail[:160])}"
+    if why:
+        q += f"\n<b>Signal:</b> {html.escape(why)}"
     if repeat:
         # Flapping: one message instead of five
         buy = f"<a href=\"{html.escape(link)}\">Buy now</a>"
@@ -233,6 +235,13 @@ def alert(store, price, link, last_restock=None, qty=None, repeat=None, confirme
                       f"(#{repeat} in {FLAP_MIN} min). Price: {p}{q}\n{buy}")
         return
     buy = f"<a href=\"{html.escape(link)}\">Buy now</a>"
+    if "playstation.com" in link and PS_LAST_SKU[0]:
+        # second way in, in case the page's button hasn't appeared yet
+        # "Add to cart" reaches Sony's stock check for the Pro (tested 8 Nov 2026);
+        # buy-now ended on a bare error page while the Pro was locked
+        buy = (f"<a href=\"{html.escape(ps_checkout_link(PS_LAST_SKU[0], 'add'))}\">Add to cart</a>"
+               f" | {buy}"
+               f" | <a href=\"{html.escape(ps_checkout_link(PS_LAST_SKU[0]))}\">Direct checkout</a>")
     send_telegram(
         f"🚨 <b>PS5 Pro IN STOCK!</b> 🚨\n"
         f"<b>Store:</b> {html.escape(store)}\n"
@@ -385,6 +394,28 @@ PS_GQL_URL = "https://web.np.playstation.com/api/graphql/v1/op"
 PS_CTA_HASH = "911a43f47dbbf7b2f3d513d6237dedfd679e57af3f34787667a22ecad6a249cd"
 PS_GQL_CLIENT = "@sie-private/web-commerce-anywhere"
 PS_GQL_VERSION = "3.48.0-2026.10.2-1.0"
+# Store API answers that put a buy button on the page. Normal for the locked
+# PS5 Pro is UNAVAILABLE (checked 8 Nov 2026).
+PS_BUY_CTAS = {"ADD_TO_CART", "PREORDER", "BUY_NOW"}
+
+
+# Sony's checkout opened directly, as the page's own buy button does (format from
+# the HAR, 8 Nov 2026). Needs you to be logged in to PSN in that browser.
+PS_CHECKOUT_CLIENT = "2dec2b13-57dc-4966-8294-6df0d627e109"
+PS_LAST_SKU = [None]  # full SKU id from the last PlayStation check
+
+
+def ps_checkout_link(sku, action="buynow"):
+    # no hostUrl: with it, the checkout expects the page's embedded flow and asks
+    # for a login again (tested 8 Nov 2026); without it, the PSN session is used
+    q = urllib.parse.urlencode({"clientId": PS_CHECKOUT_CLIENT,
+                                "privacy-policy": "minimal", "locale": "de-DE"})
+    return f"https://checkout.playstation.com/{action}/{sku}?{q}"
+
+
+def cta_buyable(cta_text):
+    m = re.match(r"cta=([A-Z_+]+)", cta_text or "")
+    return bool(m) and bool(set(m.group(1).split("+")) & PS_BUY_CTAS)
 
 
 def ps_product_id(sku):
@@ -585,10 +616,16 @@ def check_psdirect(s):
     d = parse_ps_shop_data(r.text)
     if d:
         sig = f"override={d['override']}, highDemand={d['high_demand']}"
-        # Logged and watched for changes only; the stock decision is still the page data
-        extra = f"; {ps_cta(s, d['sku'])}" + (f"; {how}" if how else "")
+        PS_LAST_SKU[0] = d["sku"]
+        cta = ps_cta(s, d["sku"])
+        extra = f"; {cta}" + (f"; {how}" if how else "")
         if ps_in_stock(d["status"], d["override"]):
             return "IN_STOCK", d["price"], f"shop data: {d['status']}; {sig}{extra}"
+        # The buy button people see comes from the store API, not the page data
+        # (Gran Turismo DualSense: page OUT_OF_STOCK, store API PREORDER, button clickable)
+        if cta_buyable(cta):
+            return "IN_STOCK", d["price"], (f"store API buy button while page says "
+                                            f"{d['status']}; {sig}{extra}")
         return "OUT", d["price"], f"shop data: {d['status']}; {sig}{extra}"
 
     # Fallback: the simple product data near the top of the page
@@ -1067,12 +1104,27 @@ def handle_result(name, link, status, price, note, st, ts):
     cta = re.search(r"cta=([A-Z_+]+(?: \(reasons: [^)]*\))?)", note or "")
     if cta:  # errors are not compared, only real answers
         before = st.get("ps_cta")
-        if before and before != cta.group(1):
+        # buy-button changes get 🚨 / ❌ instead, so 👀 is only for other changes
+        if (before and before != cta.group(1) and not cta_buyable("cta=" + cta.group(1))
+                and not cta_buyable("cta=" + before)):
             send_after_save(f"👀 <b>{html.escape(name)}</b>: Sony's store API changed the PS5 Pro "
                             f"buy button\n<b>Before:</b> {html.escape(before)}\n"
                             f"<b>Now:</b> {html.escape(cta.group(1))}\n"
                             f"<a href=\"{html.escape(link)}\">Open page</a>")
         st["ps_cta"] = cta.group(1)
+        if st.pop("cta_fail_warned", None):
+            send_after_save(f"✅ <b>{html.escape(name)}</b>: Sony's store API answers again.")
+        st.pop("cta_fail_since", None)
+    elif re.search(r"cta=(error|\?)", note or ""):
+        # The page check keeps working, so the normal ⚠️ warning would never fire
+        st.setdefault("cta_fail_since", ts)
+        down = minutes_between(st["cta_fail_since"], ts)
+        if not st.get("cta_fail_warned") and down >= FAIL_WARN_MIN:
+            err = re.search(r"cta=[^;]*", note).group(0)
+            send_after_save(f"⚠️ <b>{html.escape(name)}</b>: Sony's store API has failed for {down} min "
+                            f"({html.escape(err[:80])}). Only the page data is checked now, "
+                            f"so a drop like the 6 Nov ones could be missed.")
+            st["cta_fail_warned"] = True
     if status == "IN_STOCK" and price and price > MAX_PRICE:
         print(f"[{name}] price {price} above MAX_PRICE, no alert")
         status = "OUT"
@@ -1080,16 +1132,23 @@ def handle_result(name, link, status, price, note, st, ts):
 
     if status == "IN_STOCK" and prev != "IN_STOCK":
         qty = stock_qty(note)
+        why = None
+        if "store API buy button" in (note or ""):
+            c = re.search(r"cta=([A-Z_+]+)", note)
+            why = (f"Sony's store API shows a buy button ({c.group(1) if c else '?'}), "
+                   f"page data still says out of stock. Can still fail at checkout.")
         last_loud = st.get("last_loud_alert")
         flapping = last_loud and minutes_between(last_loud, ts) < FLAP_MIN
         if flapping:
             st["flaps"] = st.get("flaps", 1) + 1
-            alert(name, price, link, qty=qty, repeat=st["flaps"], confirmed=note if "✅" in note else False)
+            alert(name, price, link, qty=qty, repeat=st["flaps"], confirmed=note if "✅" in note else False,
+                  why=why)
             print(f"[{name}] 🔁 stock again (flap #{st['flaps']}), single message sent")
         else:
             st["flaps"] = 1
             st["last_loud_alert"] = ts
-            alert(name, price, link, st.get("last_restock"), qty=qty, confirmed=note if "✅" in note else False)
+            alert(name, price, link, st.get("last_restock"), qty=qty, confirmed=note if "✅" in note else False,
+                  why=why)
             print(f"[{name}] 🚨 ALERT SENT")
         log_history(ts, name, "IN_STOCK", price)
         st["last_restock"] = ts
@@ -1362,7 +1421,7 @@ def main():
                     break
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
-    print(f"--- PS5 Pro stock check (version 61) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 62) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups or g == "ps" and group == "ps":

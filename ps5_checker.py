@@ -403,6 +403,7 @@ PS_BUY_CTAS = {"ADD_TO_CART", "PREORDER", "BUY_NOW"}
 # the HAR, 8 Nov 2026). Needs you to be logged in to PSN in that browser.
 PS_CHECKOUT_CLIENT = "2dec2b13-57dc-4966-8294-6df0d627e109"
 PS_LAST_SKU = [None]  # full SKU id from the last PlayStation check
+PS_TEST_SKU = "PSD001-PSDE01830_39-PORTALWHITQYMODE-E000ISZU7"  # Portal, in stock
 
 
 def ps_checkout_link(sku, action="buynow"):
@@ -558,7 +559,8 @@ def ps_test(url):
         cta = ps_cta(cta_s, sku)
         lines.append(f"{verdict}\n{html.escape(name[:60])}{p}\n"
                      f"<i>status={st}, override={ov}, highDemand={hd}</i>\n"
-                     f"<i>store API: {html.escape(cta)}</i>\n<code>{html.escape(sku)}</code>")
+                     f"<i>store API: {html.escape(cta)}</i>\n<code>{html.escape(sku)}</code>\n"
+                     f"<a href=\"{html.escape(ps_checkout_link(sku, 'add'))}\">Add to cart</a>")
     if len(skus) > 40:
         lines.append(f"… {len(skus) - 40} more not shown (add a filter after the address)")
     lines.append(html.escape(url))
@@ -1388,6 +1390,13 @@ def main():
         send_telegram("✅ PS5 checker test: Telegram works. Example alert follows:")
         alert("MediaMarkt.de (TEST)", 899.99, MEDIAMARKT_URL, "2026-10-27 09:05")
         sold_out_alert("MediaMarkt.de (TEST)", 12)
+        # PlayStation example with working links: they point at the in-stock
+        # PlayStation Portal, so "Add to cart" really adds a Portal (remove it after)
+        global ALERT_REPEAT
+        reps, ALERT_REPEAT = ALERT_REPEAT, 1
+        PS_LAST_SKU[0] = PS_TEST_SKU
+        alert("PlayStation Store DE (TEST: links add a PlayStation Portal)", 249.99, PSDIRECT_PAGE)
+        PS_LAST_SKU[0], ALERT_REPEAT = None, reps
         print("Test messages sent.")
 
     mms_test_product = (os.environ.get("MMS_TEST_PRODUCT") or "").strip()

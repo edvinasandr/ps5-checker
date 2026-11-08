@@ -450,7 +450,8 @@ def list_ps_skus(t):
         if not st or sku in seen:
             continue
         seen.add(sku)
-        name = re.findall(r'"name":"([^"]{4,80})"', u[max(0, m.start() - 6000):m.start()])
+        name = re.findall(r'"name":"([^"]{4,120})"', u[max(0, m.start() - 6000):m.start()])
+        name = [re.sub(r"\\u([0-9a-fA-F]{4})", lambda x: chr(int(x.group(1), 16)), n) for n in name]
         pa = re.search(r'"physicalAttributes":\{([^}]*)\}', seg)
         attrs = pa.group(1) if pa else ""
         ov = re.search(r'"inventoryOverride":"?([^",}]*)', attrs)
@@ -494,7 +495,11 @@ def fetch_from_germany(url):
 
 def ps_test(url):
     """Manual test: read Sony's shop data from any product page and report it.
-    'de:' in front of the address fetches it from a German IP instead of GitHub (USA)."""
+    'de:' in front of the address fetches it from a German IP instead of GitHub (USA).
+    Text after a space filters the products, e.g. '<url> DUALSENSEGA' (part of the
+    product id or name)."""
+    url, _, flt = url.strip().partition(" ")
+    flt = flt.strip().lower()
     if url.lower().startswith("de:"):
         url = cache_bust(url[3:].strip())
         r, how = fetch_from_germany(url)
@@ -503,23 +508,38 @@ def ps_test(url):
         r, how = get_ps_page(s, url, lambda t: False)
         how = f"from GitHub (USA); {how}"
     skus = list_ps_skus(r.text) if r.status_code == 200 else []
-    lines = ["🧪 <b>PlayStation test</b>" + (f" <i>({how})</i>" if how else "")]
-    cta_s = make_session(False)  # the store API is always asked from GitHub
+    total = len(skus)
+    if flt:
+        skus = [x for x in skus if flt in x[0].lower() or flt in x[1].lower()]
+    head = "🧪 <b>PlayStation test</b>" + (f" <i>({how})</i>" if how else "")
+    lines = [head]
     if r.status_code != 200:
         lines.append(f"⚠️ Page could not be loaded (HTTP {r.status_code})")
-    elif not skus:
+    elif not total:
         lines.append("⚠️ No stock data found on this page")
-    for sku, name, st, ov, hd, price in skus[:10]:
+    else:
+        lines.append(f"{total} product(s) on the page" +
+                     (f", {len(skus)} matching <code>{html.escape(flt)}</code>" if flt else ""))
+    cta_s = make_session(False)  # the store API is always asked from GitHub
+    for sku, name, st, ov, hd, price in skus[:40]:
         verdict = "✅ <b>IN STOCK</b>" if ps_in_stock(st, ov) else "❌ <b>OUT OF STOCK</b>"
         p = f" – €{price:.2f}" if price else ""
         cta = ps_cta(cta_s, sku)
         lines.append(f"{verdict}\n{html.escape(name[:60])}{p}\n"
                      f"<i>status={st}, override={ov}, highDemand={hd}</i>\n"
                      f"<i>store API: {html.escape(cta)}</i>\n<code>{html.escape(sku)}</code>")
+    if len(skus) > 40:
+        lines.append(f"… {len(skus) - 40} more not shown (add a filter after the address)")
     lines.append(html.escape(url))
-    text = "\n".join(lines)
-    print(re.sub(r"<[^>]+>", "", text))
-    send_telegram(text)
+    print(re.sub(r"<[^>]+>", "", "\n".join(lines)))
+    # Telegram allows ~4096 characters per message: send in parts
+    part = ""
+    for ln in lines:
+        if part and len(part) + len(ln) > 3800:
+            send_telegram(part)
+            part = head + " <i>(continued)</i>"
+        part = f"{part}\n{ln}" if part else ln
+    send_telegram(part)
 
 
 def cache_bust(url):

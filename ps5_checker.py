@@ -365,7 +365,8 @@ def parse_ps_shop_data(t):
         ov = re.search(r'"inventoryOverride":"?([^",}]*)', attrs)
         hd = re.search(r'"highDemand":(true|false)', attrs)
         pr = re.search(r'"price":(\d+)', seg)
-        return {"status": st.group(1),
+        return {"sku": m.group(1),
+                "status": st.group(1),
                 "override": (ov.group(1) if ov else "") or "none",
                 "high_demand": (hd.group(1) if hd else "unknown"),
                 "price": int(pr.group(1)) / 100 if pr else None}
@@ -375,6 +376,67 @@ def parse_ps_shop_data(t):
 def ps_in_stock(status, override):
     """The one rule both the real check and the test use."""
     return status not in PS_OUT_STATUSES and str(override).lower() != "forceoutofstock"
+
+
+# Sony's store API that decides which button the shop shows ("In den Warenkorb"
+# or not). Found in a HAR of an in-stock product (PlayStation Portal, v61).
+# It is a separate, uncached request (no-store), not part of the page data.
+PS_GQL_URL = "https://web.np.playstation.com/api/graphql/v1/op"
+PS_CTA_HASH = "911a43f47dbbf7b2f3d513d6237dedfd679e57af3f34787667a22ecad6a249cd"
+PS_GQL_CLIENT = "@sie-private/web-commerce-anywhere"
+PS_GQL_VERSION = "3.48.0-2026.10.2-1.0"
+
+
+def ps_product_id(sku):
+    """'PSD001-PSDE01830_39-PORTALWHITQYMODE-E000ISZU7' -> product id without the SKU suffix."""
+    parts = (sku or "").split("-")
+    return "-".join(parts[:3]) if len(parts) >= 4 and parts[0].startswith("PSD") else ""
+
+
+def ps_cta(s, sku):
+    """Ask Sony's store API which buy button it would show for this SKU.
+    Returns a short text like 'cta=ADD_TO_CART' or 'cta=NONE (reasons: ...)'."""
+    pid = ps_product_id(sku)
+    if not pid:
+        return f"cta=? (unexpected SKU id {sku!r})"
+    params = urllib.parse.urlencode({
+        "operationName": "productRetrieveForCtasWithPrice",
+        "variables": json.dumps({"productId": pid}, separators=(",", ":")),
+        "extensions": json.dumps({"persistedQuery": {"version": 1, "sha256Hash": PS_CTA_HASH}},
+                                 separators=(",", ":"))})
+    try:
+        r = s.get(f"{PS_GQL_URL}?{params}", timeout=15, headers={
+            "Accept": "application/json", "Content-Type": "application/json",
+            "Origin": "https://www.playstation.com", "Referer": "https://www.playstation.com/",
+            "Cache-Control": "no-cache", "Pragma": "no-cache",
+            "apollographql-client-name": PS_GQL_CLIENT,
+            "apollographql-client-version": PS_GQL_VERSION,
+            "x-psn-app-ver": f"{PS_GQL_CLIENT}/{PS_GQL_VERSION}",
+            "x-psn-store-locale-override": "de-DE",
+            "disable_query_whitelist": "false"})
+    except Exception as e:
+        return f"cta=error ({str(e)[:60]})"
+    if r.status_code != 200:
+        return f"cta=error (HTTP {r.status_code})"
+    try:
+        d = r.json()
+    except ValueError:
+        return "cta=error (no JSON)"
+    if d.get("errors"):
+        return f"cta=error ({str(d['errors'][0].get('message', ''))[:60]})"
+    prod = (d.get("data") or {}).get("productRetrieve")
+    if not prod:
+        return "cta=not found"
+    types, reasons = [], set()
+    for c in prod.get("webctas") or []:
+        types.append(str(c.get("type") or "?"))
+        for x in ((c.get("meta") or {}).get("ineligibilityReasons") or []):
+            if x.get("type"):
+                reasons.add(str(x["type"]))
+    text = "cta=" + ("+".join(types) if types else "NONE")
+    if reasons - {"UNKNOWN"}:
+        text += f" (reasons: {', '.join(sorted(reasons))})"
+    return text
 
 
 def list_ps_skus(t):
@@ -400,12 +462,49 @@ def list_ps_skus(t):
     return out
 
 
+class PageFromApi:
+    """Minimal response object for a page fetched through the Oxylabs Web API."""
+    def __init__(self, status_code, text):
+        self.status_code, self.text, self.headers = status_code, text, {}
+
+
+def fetch_from_germany(url):
+    """One page through the Oxylabs Web API with a German IP (test only, ~1 request)."""
+    key = (os.environ.get("OXY_WEB_API_KEY") or "").strip()
+    if not key:
+        return PageFromApi(0, ""), "⚠️ secret OXY_WEB_API_KEY missing"
+    if not key.lower().startswith("bearer "):
+        key = f"Bearer {key}"
+    try:
+        r = requests.post("https://webapi.oxylabs.io/v1/scrape", timeout=120,
+                          json={"url": url, "output": ["html"], "run_js": False, "location": "DE"},
+                          headers={"Content-Type": "application/json", "Authorization": key})
+    except Exception as e:
+        return PageFromApi(0, ""), f"⚠️ Web API error: {str(e)[:100]}"
+    if r.status_code not in (200, 201):
+        return PageFromApi(r.status_code, ""), f"⚠️ Web API HTTP {r.status_code}: {r.text[:120]}"
+    try:
+        page = (r.json().get("results") or [{}])[0].get("html") or ""
+    except ValueError:
+        page = ""
+    if isinstance(page, list):
+        page = "".join(str(x) for x in page)
+    return PageFromApi(200 if page else 0, str(page)), "from Germany via Web API"
+
+
 def ps_test(url):
-    """Manual test: read Sony's shop data from any product page and report it."""
-    s = make_session(False)
-    r, how = get_ps_page(s, url, lambda t: False)
+    """Manual test: read Sony's shop data from any product page and report it.
+    'de:' in front of the address fetches it from a German IP instead of GitHub (USA)."""
+    if url.lower().startswith("de:"):
+        url = cache_bust(url[3:].strip())
+        r, how = fetch_from_germany(url)
+    else:
+        s = make_session(False)
+        r, how = get_ps_page(s, url, lambda t: False)
+        how = f"from GitHub (USA); {how}"
     skus = list_ps_skus(r.text) if r.status_code == 200 else []
     lines = ["🧪 <b>PlayStation test</b>" + (f" <i>({how})</i>" if how else "")]
+    cta_s = make_session(False)  # the store API is always asked from GitHub
     if r.status_code != 200:
         lines.append(f"⚠️ Page could not be loaded (HTTP {r.status_code})")
     elif not skus:
@@ -413,8 +512,10 @@ def ps_test(url):
     for sku, name, st, ov, hd, price in skus[:10]:
         verdict = "✅ <b>IN STOCK</b>" if ps_in_stock(st, ov) else "❌ <b>OUT OF STOCK</b>"
         p = f" – €{price:.2f}" if price else ""
+        cta = ps_cta(cta_s, sku)
         lines.append(f"{verdict}\n{html.escape(name[:60])}{p}\n"
-                     f"<i>status={st}, override={ov}, highDemand={hd}</i>")
+                     f"<i>status={st}, override={ov}, highDemand={hd}</i>\n"
+                     f"<i>store API: {html.escape(cta)}</i>\n<code>{html.escape(sku)}</code>")
     lines.append(html.escape(url))
     text = "\n".join(lines)
     print(re.sub(r"<[^>]+>", "", text))
@@ -464,7 +565,8 @@ def check_psdirect(s):
     d = parse_ps_shop_data(r.text)
     if d:
         sig = f"override={d['override']}, highDemand={d['high_demand']}"
-        extra = f"; {how}" if how else ""
+        # Logged and watched for changes only; the stock decision is still the page data
+        extra = f"; {ps_cta(s, d['sku'])}" + (f"; {how}" if how else "")
         if ps_in_stock(d["status"], d["override"]):
             return "IN_STOCK", d["price"], f"shop data: {d['status']}; {sig}{extra}"
         return "OUT", d["price"], f"shop data: {d['status']}; {sig}{extra}"
@@ -942,6 +1044,15 @@ def handle_result(name, link, status, price, note, st, ts):
                             f"This often happens shortly before a drop. "
                             f"<a href=\"{html.escape(link)}\">Open page</a>")
         st["ps_signals"] = now_sig
+    cta = re.search(r"cta=([A-Z_+]+(?: \(reasons: [^)]*\))?)", note or "")
+    if cta:  # errors are not compared, only real answers
+        before = st.get("ps_cta")
+        if before and before != cta.group(1):
+            send_after_save(f"👀 <b>{html.escape(name)}</b>: Sony's store API changed the PS5 Pro "
+                            f"buy button\n<b>Before:</b> {html.escape(before)}\n"
+                            f"<b>Now:</b> {html.escape(cta.group(1))}\n"
+                            f"<a href=\"{html.escape(link)}\">Open page</a>")
+        st["ps_cta"] = cta.group(1)
     if status == "IN_STOCK" and price and price > MAX_PRICE:
         print(f"[{name}] price {price} above MAX_PRICE, no alert")
         status = "OUT"
@@ -1101,15 +1212,6 @@ def report_for(kind, states, now):
     return None
 
 
-def restocks_on(day):
-    try:
-        with open(HISTORY_FILE, encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-    except FileNotFoundError:
-        return []
-    return [r for r in rows if r["time_vilnius"].startswith(day)]
-
-
 def maybe_send_summary(states, now):
     """Once a day after SUMMARY_HOUR: report on yesterday."""
     meta = states["proxy"].setdefault("_meta", {})
@@ -1240,7 +1342,7 @@ def main():
                     break
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
-    print(f"--- PS5 Pro stock check (version 59) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 61) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups or g == "ps" and group == "ps":

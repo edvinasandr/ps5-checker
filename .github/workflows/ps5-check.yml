@@ -15,7 +15,7 @@ on:
         options: [none, this hour, last hour, today, yesterday]
         default: none
       ps_test_url:
-        description: "Test only: a PlayStation product page to read (no checks run)"
+        description: "Test only: a PlayStation page to read (put de: in front to read it from Germany)"
         type: string
         default: ""
       mms_test_product:
@@ -60,6 +60,7 @@ jobs:
           OXYLABS_USER: ${{ secrets.OXYLABS_USER }}
           OXYLABS_PASS: ${{ secrets.OXYLABS_PASS }}
           MMS_ADDRESS: ${{ secrets.MMS_ADDRESS }}
+          OXY_WEB_API_KEY: ${{ secrets.OXY_WEB_API_KEY }}   # only for the PlayStation test with de:
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           PSDIRECT_URL: ${{ vars.PSDIRECT_URL }}
@@ -70,6 +71,7 @@ jobs:
           PROXY_EVERY_MIN: "5"    # expert
           PS_EVERY_SEC: "20"      # PlayStation check interval inside one run
           PS_LOOP_SEC: "330"      # how long one PlayStation run keeps checking (cron: every 5 min)
+          PS_CTA_EVERY_SEC: "5"   # quick Sony store API check between PlayStation checks (0 = off)
           STORE_GROUP: ${{ env.GROUP }}
           TEST_ALERT: ${{ inputs.test_alert }}
           DEBUG: ${{ inputs.debug }}

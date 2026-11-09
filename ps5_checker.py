@@ -220,8 +220,9 @@ def stock_qty(note):
 
 
 def alert(store, price, link, last_restock=None, qty=None, repeat=None, confirmed=False, why=None):
-    if "playstation.com" in link:
-        link = cache_bust(link)  # fresh page instead of the CDN's stored copy
+    # PlayStation: the plain product page, exactly as you'd open it yourself. The page
+    # is never cached (no-store), and the direct cart/checkout links failed in real
+    # drops (9 Nov 2026), so they are not offered any more.
     p = f"€{price:.2f}" if price else "unknown"
     last = f"\n<b>Last restock here:</b> {last_restock}" if last_restock else ""
     q = f"\n<b>Stock:</b> {qty} unit{'s' if qty != 1 else ''}" if qty is not None else ""
@@ -238,18 +239,14 @@ def alert(store, price, link, last_restock=None, qty=None, repeat=None, confirme
         send_telegram(f"🔁 <b>{html.escape(store)}</b> shows stock again "
                       f"(#{repeat} in {FLAP_MIN} min). Price: {p}{q}\n{buy}")
         return
-    buy = f"<a href=\"{html.escape(link)}\">Buy now</a>"
-    if "playstation.com" in link and PS_LAST_SKU[0]:
-        # second way in, in case the page's button hasn't appeared yet
-        # "Add to cart" reaches Sony's stock check for the Pro (tested 8 Nov 2026);
-        # buy-now ended on a bare error page while the Pro was locked
-        buy = (f"<a href=\"{html.escape(ps_checkout_link(PS_LAST_SKU[0], 'add'))}\">Add to cart</a>"
-               f" | {buy}"
-               f" | <a href=\"{html.escape(ps_checkout_link(PS_LAST_SKU[0]))}\">Direct checkout</a>")
+    buy = steps = f"<a href=\"{html.escape(link)}\">Buy now</a>"
+    if "playstation.com" in link:
+        buy = f"<a href=\"{html.escape(link)}\">Open PS5 Pro page</a>"
+        steps = f"{buy}\n→ In den Warenkorb → Warenkorb → Weiter zur Kasse → Apple Pay"
     send_telegram(
         f"🚨 <b>PS5 Pro IN STOCK!</b> 🚨\n"
         f"<b>Store:</b> {html.escape(store)}\n"
-        f"<b>Price:</b> {p}{q}{last}\n" + buy
+        f"<b>Price:</b> {p}{q}{last}\n" + steps
     )
     # Repeat a short version so the phone buzzes several times
     for i in range(2, ALERT_REPEAT + 1):
@@ -1158,7 +1155,10 @@ def handle_result(name, link, status, price, note, st, ts):
             why = (f"Sony's store API shows a buy button ({c.group(1) if c else '?'}), "
                    f"page data still says out of stock. Can still fail at checkout.")
         last_loud = st.get("last_loud_alert")
-        flapping = last_loud and minutes_between(last_loud, ts) < FLAP_MIN
+        # PlayStation drops are real and short (~1 min, sometimes twice within 30 min),
+        # so every one gets the full alert; flapping protection is for the other stores
+        flapping = (last_loud and minutes_between(last_loud, ts) < FLAP_MIN
+                    and "PlayStation" not in name)
         if flapping:
             st["flaps"] = st.get("flaps", 1) + 1
             alert(name, price, link, qty=qty, repeat=st["flaps"], confirmed=note if "✅" in note else False,
@@ -1426,9 +1426,8 @@ def main():
         # PlayStation Portal, so "Add to cart" really adds a Portal (remove it after)
         global ALERT_REPEAT
         reps, ALERT_REPEAT = ALERT_REPEAT, 1
-        PS_LAST_SKU[0] = PS_TEST_SKU
-        alert("PlayStation Store DE (TEST: links add a PlayStation Portal)", 249.99, PSDIRECT_PAGE)
-        PS_LAST_SKU[0], ALERT_REPEAT = None, reps
+        alert("PlayStation Store DE (TEST)", 899.99, PSDIRECT_PAGE)
+        ALERT_REPEAT = reps
         print("Test messages sent.")
 
     mms_test_product = (os.environ.get("MMS_TEST_PRODUCT") or "").strip()

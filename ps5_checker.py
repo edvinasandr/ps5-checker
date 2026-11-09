@@ -977,13 +977,25 @@ def gist_headers():
             "User-Agent": "ps5-stock-checker"}  # GitHub rejects requests without one
 
 
+def gist_quota(r):
+    """GitHub's API allowance for the token's user (shared by everything using that
+    account's tokens), e.g. 'GitHub API: 4870/5000 left, resets 11:02'."""
+    h = r.headers
+    left, limit, reset = h.get("x-ratelimit-remaining"), h.get("x-ratelimit-limit"), h.get("x-ratelimit-reset")
+    if left is None:
+        return ""
+    when = datetime.fromtimestamp(int(reset), TZ).strftime("%H:%M") if reset else "?"
+    return f"GitHub API: {left}/{limit} left, resets {when} Vilnius"
+
+
 def gist_error(r):
     """GitHub's own explanation, e.g. 'Resource not accessible by personal access token'."""
     try:
         msg = r.json().get("message", "")
     except Exception:
         msg = r.text[:150]
-    return f"HTTP {r.status_code}: {msg}"
+    q = gist_quota(r)
+    return f"HTTP {r.status_code}: {msg[:90]}" + (f" ({q})" if q else "")
 
 
 def load_all_states():
@@ -1017,6 +1029,8 @@ def load_from_gist():
             r = requests.get(GIST_API, headers=gist_headers(), timeout=15)
             if r.status_code != 200:
                 raise Exception(gist_error(r))
+            if gist_quota(r):
+                print(gist_quota(r))
             files = r.json().get("files", {})
             for g in GROUPS:
                 f = files.get(state_file(g))
@@ -1030,7 +1044,7 @@ def load_from_gist():
                 else:
                     raw[g], ok[g] = f.get("content") or "{}", True
         except Exception as e:
-            print(f"Could not load state from Gist: {str(e)[:150]}")
+            print(f"Could not load state from Gist: {str(e)[:220]}")
             for g in GROUPS:
                 raw[g], ok[g] = "{}", False
     return raw, ok
@@ -1047,7 +1061,7 @@ def save_states(states, groups):
                 raise Exception(gist_error(r))
             return True
         except Exception as e:
-            print(f"Could not save state to Gist: {str(e)[:150]}")
+            print(f"Could not save state to Gist: {str(e)[:220]}")
             return False
     for g in groups:
         with open(state_file(g), "w") as f:

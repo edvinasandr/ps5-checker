@@ -54,6 +54,10 @@ EVERY_MIN = {"ps": 1,  # PlayStation runs as a loop, see PS_EVERY_SEC
 # PlayStation: one run stays alive for PS_LOOP_SEC and checks every PS_EVERY_SEC
 PS_EVERY_SEC = max(10, int(os.environ.get("PS_EVERY_SEC", "20")))
 PS_LOOP_SEC = int(os.environ.get("PS_LOOP_SEC", "330"))
+# Between those full checks, only Sony's store API is asked (small and fast).
+# If its buy button differs from the saved status, a full check runs at once.
+# 9 Nov 2026 drop: buy button live ~09:57:00–09:58:15, i.e. about 70–90 seconds.
+PS_CTA_EVERY_SEC = int(os.environ.get("PS_CTA_EVERY_SEC", "5"))  # 0 = off
 # Optional slower interval for single stores: {"store name": minutes}
 STORE_EVERY_MIN = {}
 
@@ -1365,24 +1369,38 @@ def flush_after_save(states, groups):
 
 
 def ps_loop(states, loaded):
-    """PlayStation every PS_EVERY_SEC seconds for PS_LOOP_SEC. Drops last ~1 minute,
-    so a fresh run per minute (plus GitHub's start delay) is too slow."""
+    """PlayStation: full check every PS_EVERY_SEC seconds for PS_LOOP_SEC, and a quick
+    store-API-only check every PS_CTA_EVERY_SEC seconds in between. Drops last ~1
+    minute, so a fresh run per minute (plus GitHub's start delay) is too slow."""
     name, fn, link, g = next(x for x in STORES if x[3] == "ps")
     end = time.monotonic() + PS_LOOP_SEC
-    n = 0
+    quick = 0 < PS_CTA_EVERY_SEC < PS_EVERY_SEC
+    qs = make_session(False) if quick else None
+    n = nq = 0
+    next_full = time.monotonic()
     while True:
-        t0 = time.monotonic()
+        now = time.monotonic()
         prev = states[g].get(name, {}).get("status")
-        status = run_store(name, fn, link, g, states, datetime.now(TZ))
-        n += 1
-        if loaded[g] and (AFTER_SAVE or status != prev):
-            flush_after_save(states, [g])  # changes are saved and announced right away
-        wait = PS_EVERY_SEC - (time.monotonic() - t0)
-        if time.monotonic() + max(wait, 0) >= end:
+        full = now >= next_full
+        if not full and PS_LAST_SKU[0]:
+            nq += 1
+            cta = ps_cta(qs, PS_LAST_SKU[0])
+            # errors are ignored here; the full checks report them
+            if not cta.startswith(("cta=error", "cta=?")) and cta_buyable(cta) != (prev == "IN_STOCK"):
+                print(f"{datetime.now(TZ):%H:%M:%S} [{name}] quick store API check: {cta} -> full check now")
+                full = True
+        if full:
+            status = run_store(name, fn, link, g, states, datetime.now(TZ))
+            n += 1
+            if loaded[g] and (AFTER_SAVE or status != prev):
+                flush_after_save(states, [g])  # changes are saved and announced right away
+            next_full = time.monotonic() + PS_EVERY_SEC
+        step = PS_CTA_EVERY_SEC if quick else PS_EVERY_SEC
+        wake = min(next_full, now + step)
+        if wake >= end:
             break
-        if wait > 0:
-            time.sleep(wait)
-    print(f"[{name}] {n} checks in this run")
+        time.sleep(max(0, wake - time.monotonic()))
+    print(f"[{name}] {n} full checks, {nq} quick store API checks in this run")
 
 
 def main():
@@ -1430,7 +1448,7 @@ def main():
                     break
     now = datetime.now(TZ)
     ts = now.strftime("%Y-%m-%d %H:%M")
-    print(f"--- PS5 Pro stock check (version 62) --- {ts} Vilnius, group: {group}")
+    print(f"--- PS5 Pro stock check (version 63) --- {ts} Vilnius, group: {group}")
 
     for name, fn, link, g in STORES:
         if g not in run_groups or g == "ps" and group == "ps":
